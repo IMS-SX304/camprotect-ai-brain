@@ -1,7 +1,7 @@
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const config = require("./webflow-next-config.cjs");
+// webflow-loader.ts (ROOT)
+// On ne dépend pas de next.config.* (TS ne le résout pas en build Webflow Cloud)
 
-const basePath = config.basePath || "";
-const assetPrefix = config.assetPrefix || basePath;
+const cfg = require("./webflow-next-config.cjs");
 
-export { basePath, assetPrefix };
+export const basePath = cfg.basePath ?? "";
+export const assetPrefix = cfg.assetPrefix ?? basePath;
