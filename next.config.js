@@ -1,5 +1,6 @@
 /** @type {import('next').NextConfig} */
-module.exports = {
-  basePath: "/ai",
-  assetPrefix: "/ai"
+const nextConfig = {
+  reactStrictMode: true,
 };
+
+module.exports = nextConfig;
