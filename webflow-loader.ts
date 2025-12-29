@@ -1,7 +1,6 @@
-// webflow-loader.ts (ROOT)
-// On ne dépend pas de next.config.* (TS ne le résout pas en build Webflow Cloud)
+// Webflow Cloud loader shim
+// We avoid importing ./next.config because Webflow may generate next.config.ts
+// or rename files during build, which breaks TS module resolution.
 
-const cfg = require("./webflow-next-config.cjs");
-
-export const basePath = cfg.basePath ?? "";
-export const assetPrefix = cfg.assetPrefix ?? basePath;
+export const basePath = "";
+export const assetPrefix = "";
