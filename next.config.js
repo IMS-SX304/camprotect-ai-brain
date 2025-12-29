@@ -1,4 +1,5 @@
 /** @type {import('next').NextConfig} */
 module.exports = {
-  output: "standalone"
+  basePath: "/ai",
+  assetPrefix: "/ai"
 };
