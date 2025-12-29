@@ -10,6 +10,8 @@ export default {
     }
   },
 
+  edgeExternals: ["node:crypto"],
+
   middleware: {
     external: true,
     override: {
