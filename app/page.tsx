@@ -4,7 +4,7 @@ export default function Page() {
       <h1>CamProtect AI Brain</h1>
       <p>Déploiement OK ✅</p>
       <p>
-        Health check : <a href="/api/health">/api/health</a>
+        Health check : <a href="./api/health">/api/health</a>
       </p>
     </main>
   );
