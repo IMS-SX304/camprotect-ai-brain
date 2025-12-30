@@ -3,10 +3,7 @@
   "private": true,
   "version": "0.0.1",
   "scripts": {
-    "prebuild": "node scripts/rm-next-config-ts.mjs",
-    "build": "next build",
-    "dev": "next dev",
-    "start": "next start"
+    "build": "opennextjs-cloudflare build"
   },
   "dependencies": {
     "next": "14.2.35",
