@@ -4,8 +4,8 @@
   "version": "0.0.1",
   "scripts": {
     "dev": "next dev",
-    "prebuild": "node scripts/rm-next-config-ts.mjs",
-    "build": "next build",
+    "build:next": "next build",
+    "build": "opennextjs-cloudflare build",
     "start": "next start"
   },
   "dependencies": {
@@ -14,6 +14,7 @@
     "react-dom": "18.2.0"
   },
   "devDependencies": {
-    "@opennextjs/cloudflare": "^1.0.0"
+    "@opennextjs/cloudflare": "^1.0.0",
+    "typescript": "^5.6.3"
   }
 }
