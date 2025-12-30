@@ -7,6 +7,17 @@ type ChatMessage = {
   content: string;
 };
 
+export async function GET() {
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      hint: "Use POST /ai/api/chat with JSON body { input: string }",
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => null)) as
