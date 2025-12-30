@@ -6,8 +6,8 @@ export default {
       proxyExternalRequest: "fetch",
       incrementalCache: "dummy",
       tagCache: "dummy",
-      queue: "dummy"
-    }
+      queue: "dummy",
+    },
   },
 
   edgeExternals: ["node:crypto"],
@@ -20,7 +20,7 @@ export default {
       proxyExternalRequest: "fetch",
       incrementalCache: "dummy",
       tagCache: "dummy",
-      queue: "dummy"
-    }
-  }
+      queue: "dummy",
+    },
+  },
 };
