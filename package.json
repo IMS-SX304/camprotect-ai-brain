@@ -3,8 +3,9 @@
   "private": true,
   "version": "0.0.1",
   "scripts": {
-    "dev": "next dev",
+    "prebuild": "node scripts/rm-next-config-ts.mjs",
     "build": "next build",
+    "dev": "next dev",
     "start": "next start"
   },
   "dependencies": {
