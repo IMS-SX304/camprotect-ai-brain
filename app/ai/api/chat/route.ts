@@ -10,24 +10,44 @@ type ChatBody = {
   topK?: number;
 };
 
+type RagSource = {
+  id: number;
+  title?: string;
+  url?: string;
+  similarity?: number;
+};
+
 function extractSku(text: string): string | null {
   // Ex: DS-7616NXI-I2-S, NVR4104HS-4KS3, etc.
   const m = text.match(/[A-Z0-9]{2,}-[A-Z0-9-]{3,}/i);
   return m ? m[0].toUpperCase() : null;
 }
 
-function normalizeUrl(u?: string | null): string | null {
-  if (!u) return null;
+function undefIfNull<T>(v: T | null | undefined): T | undefined {
+  return v === null || v === undefined ? undefined : v;
+}
+
+function normalizeUrl(u?: string | null): string | undefined {
+  if (!u) return undefined;
+
+  const trimmed = String(u).trim();
+  if (!trimmed) return undefined;
+
   try {
-    // Si déjà absolute URL
-    const url = new URL(u);
+    // Déjà absolute URL
+    const url = new URL(trimmed);
     return url.toString();
   } catch {
-    // Sinon, on tente de le forcer en relatif camprotect.fr
-    const trimmed = u.trim();
+    // Sinon, on le force vers camprotect.fr
     if (trimmed.startsWith("/")) return `https://camprotect.fr${trimmed}`;
     return `https://camprotect.fr/${trimmed.replace(/^https?:\/\//, "")}`;
   }
+}
+
+function toNumberOrUndefined(v: any): number | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 export async function POST(req: Request) {
@@ -47,7 +67,7 @@ export async function POST(req: Request) {
     // 1) Lookup direct produit si SKU détecté (priorité)
     const sku = extractSku(input);
     let productContext = "";
-    let productUrl: string | null = null;
+    let productUrl: string | undefined;
 
     if (sku) {
       const { data: p, error } = await supa
@@ -58,6 +78,7 @@ export async function POST(req: Request) {
 
       if (!error && p) {
         productUrl = normalizeUrl(p.url);
+
         const priceStr =
           p.price !== null && p.price !== undefined
             ? `${p.price} ${p.currency || "EUR"}`
@@ -65,7 +86,7 @@ export async function POST(req: Request) {
 
         // payload: tu peux y mettre plein d’infos CMS (specs, compatibilités…)
         const payloadStr =
-          p.payload && Object.keys(p.payload).length > 0
+          p.payload && typeof p.payload === "object" && Object.keys(p.payload).length > 0
             ? `\nDonnées techniques (payload): ${JSON.stringify(p.payload)}`
             : "";
 
@@ -85,10 +106,10 @@ export async function POST(req: Request) {
 
     // 2) RAG documents si pas de produit trouvé (ou pas de SKU)
     let ragUsed = 0;
-    let ragSources: Array<{ id: number; title?: string; url?: string; similarity?: number }> = [];
+    let ragSources: RagSource[] = [];
     let docsContext = "";
 
-    // On n’empile pas trop: si on a déjà le produit exact, les docs sont optionnels.
+    // Si on a déjà le produit exact, les docs deviennent optionnels.
     const shouldUseDocs = !productContext;
 
     if (shouldUseDocs) {
@@ -100,7 +121,6 @@ export async function POST(req: Request) {
       });
 
       if (rpcErr) {
-        // On ne bloque pas toute la réponse : on remonte l'erreur proprement
         return Response.json(
           { ok: false, error: "Supabase match_documents failed", details: rpcErr.message },
           { status: 500 }
@@ -111,13 +131,13 @@ export async function POST(req: Request) {
         ragUsed = docs.length;
 
         ragSources = docs.map((d: any) => ({
-          id: d.id,
-          title: d.title || d.source,
-          url: normalizeUrl(d.url),
-          similarity: typeof d.similarity === "number" ? d.similarity : undefined,
+          id: Number(d.id),
+          title: (d.title || d.source || undefined) as string | undefined,
+          url: normalizeUrl(d.url), // <- jamais null
+          similarity: toNumberOrUndefined(d.similarity),
         }));
 
-        // On construit un contexte court et clair
+        // Contexte court + clair
         const blocks = docs.map((d: any, idx: number) => {
           const title = d.title || d.source || `Doc ${idx + 1}`;
           const url = normalizeUrl(d.url);
@@ -128,10 +148,16 @@ export async function POST(req: Request) {
         docsContext = `### Contexte CamProtect (documents)\n${blocks.join("\n")}\n`;
       }
     } else {
+      // Produit exact trouvé => on renvoie une source "produit"
       ragUsed = 1;
-      ragSources = productUrl
-        ? [{ id: 0, title: "Produit CamProtect", url: productUrl, similarity: 1 }]
-        : [{ id: 0, title: "Produit CamProtect", url: undefined, similarity: 1 }];
+      ragSources = [
+        {
+          id: 0,
+          title: "Produit CamProtect",
+          url: undefIfNull(productUrl),
+          similarity: 1,
+        },
+      ];
     }
 
     // 3) Appel OpenAI avec règles CamProtect-first
@@ -142,10 +168,9 @@ export async function POST(req: Request) {
       { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
       {
         role: "system" as const,
-        content:
-          context
-            ? `Tu disposes du CONTEXTE ci-dessous. Utilise-le en priorité.\n\n${context}`
-            : `Aucun contexte interne trouvé. Dans ce cas, tu dois demander une précision et proposer des alternatives disponibles CamProtect.`,
+        content: context
+          ? `Tu disposes du CONTEXTE ci-dessous. Utilise-le en priorité.\n\n${context}`
+          : `Aucun contexte interne trouvé. Dans ce cas, tu dois demander une précision et proposer des alternatives disponibles sur CamProtect.`,
       },
       { role: "user" as const, content: input },
     ];
