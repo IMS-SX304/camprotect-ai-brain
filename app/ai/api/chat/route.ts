@@ -170,18 +170,17 @@ export async function POST(req: Request) {
         docsContext = `### Contexte CamProtect (documents)\n${blocks.join("\n")}\n`;
       }
     } else {
-      // On a trouvé un produit exact -> on considère qu'on a 1 source interne fiable
-      ragUsed = 1;
-      ragSources = [
-        {
-          id: 0,
-          title: "Produit CamProtect",
-          url: productUrl,
-          similarity: 1,
-        },
-      ];
-    }
-
+  // Produit exact trouvé => on force une source "CamProtect produit"
+  ragUsed = 1;
+  ragSources = [
+    {
+      id: 0,
+      title: "Produit CamProtect",
+      ...(productUrl ? { url: productUrl } : {}),
+      similarity: 1,
+    },
+  ];
+}
     // =========================
     // 3) Appel IA avec contexte
     // =========================
