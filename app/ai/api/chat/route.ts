@@ -70,11 +70,25 @@ export async function POST(req: Request) {
     let productUrl: string | undefined;
 
     if (sku) {
-      const { data: p, error } = await supa
-        .from("products")
-        .select("sku,name,brand,product_type,url,price,currency,description,payload")
-        .eq("sku", sku)
-        .maybeSingle();
+     const { data: pExact, error: errExact } = await supa
+  .from("products")
+  .select("sku,name,brand,product_type,url,price,currency,description,payload")
+  .eq("sku", sku)
+  .maybeSingle();
+
+let p = pExact;
+
+if (!p) {
+  // fallback tolérant : recherche partielle
+  const { data: pLike, error: errLike } = await supa
+    .from("products")
+    .select("sku,name,brand,product_type,url,price,currency,description,payload")
+    .ilike("sku", `%${sku}%`)
+    .limit(1)
+    .maybeSingle();
+
+  if (!errLike && pLike) p = pLike;
+}
 
       if (!error && p) {
         productUrl = normalizeUrl(p.url);
