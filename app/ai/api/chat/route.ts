@@ -13,41 +13,33 @@ type ChatBody = {
 type RagSource = {
   id: number;
   title?: string;
-  url?: string;
+  url?: string; // IMPORTANT: undefined (pas null) pour TS
   similarity?: number;
 };
 
 function extractSku(text: string): string | null {
-  // Ex: DS-7616NXI-I2-S, NVR4104HS-4KS3, etc.
-  const m = text.match(/[A-Z0-9]{2,}-[A-Z0-9-]{3,}/i);
+  // Capte des refs type: DS-7616NXI-I2-S, NVR4104HS-4KS3, etc.
+  // On évite de capturer des mots trop courts.
+  const m = text.match(/\b[A-Z0-9]{2,}(?:-[A-Z0-9]{2,}){2,}\b/i);
   return m ? m[0].toUpperCase() : null;
-}
-
-function undefIfNull<T>(v: T | null | undefined): T | undefined {
-  return v === null || v === undefined ? undefined : v;
 }
 
 function normalizeUrl(u?: string | null): string | undefined {
   if (!u) return undefined;
-
-  const trimmed = String(u).trim();
-  if (!trimmed) return undefined;
-
   try {
-    // Déjà absolute URL
-    const url = new URL(trimmed);
+    const url = new URL(u);
     return url.toString();
   } catch {
-    // Sinon, on le force vers camprotect.fr
+    const trimmed = String(u).trim();
+    if (!trimmed) return undefined;
     if (trimmed.startsWith("/")) return `https://camprotect.fr${trimmed}`;
     return `https://camprotect.fr/${trimmed.replace(/^https?:\/\//, "")}`;
   }
 }
 
-function toNumberOrUndefined(v: any): number | undefined {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : undefined;
+function normalizeSkuForSearch(sku: string): string {
+  // enlève tirets, slash, espaces, underscore => pour trouver des variantes
+  return sku.replace(/[-\/\s_]/g, "").toUpperCase();
 }
 
 export async function POST(req: Request) {
@@ -61,36 +53,53 @@ export async function POST(req: Request) {
 
     const topK = body.topK ?? 6;
     const conversationId = body.conversationId ?? crypto.randomUUID();
-
     const supa = supabaseAdmin();
 
+    // =========================
     // 1) Lookup direct produit si SKU détecté (priorité)
+    // =========================
     const sku = extractSku(input);
     let productContext = "";
     let productUrl: string | undefined;
 
     if (sku) {
-     const { data: pExact, error: errExact } = await supa
-  .from("products")
-  .select("sku,name,brand,product_type,url,price,currency,description,payload")
-  .eq("sku", sku)
-  .maybeSingle();
+      // 1) exact match
+      const { data: pExact, error: errExact } = await supa
+        .from("products")
+        .select("sku,name,brand,product_type,url,price,currency,description,payload")
+        .eq("sku", sku)
+        .maybeSingle();
 
-let p = pExact;
+      // 2) ilike fallback
+      let p = pExact;
+      if (!p) {
+        const { data: pLike, error: errLike } = await supa
+          .from("products")
+          .select("sku,name,brand,product_type,url,price,currency,description,payload")
+          .ilike("sku", `%${sku}%`)
+          .limit(1)
+          .maybeSingle();
 
-if (!p) {
-  // fallback tolérant : recherche partielle
-  const { data: pLike, error: errLike } = await supa
-    .from("products")
-    .select("sku,name,brand,product_type,url,price,currency,description,payload")
-    .ilike("sku", `%${sku}%`)
-    .limit(1)
-    .maybeSingle();
+        if (!errLike && pLike) p = pLike;
+      }
 
-  if (!errLike && pLike) p = pLike;
-}
+      // 3) normalisé (si en base c’est stocké différemment)
+      if (!p) {
+        const skuNorm = normalizeSkuForSearch(sku);
+        // on récupère quelques lignes candidates et on compare côté code
+        const { data: candidates, error: errCand } = await supa
+          .from("products")
+          .select("sku,name,brand,product_type,url,price,currency,description,payload")
+          .ilike("sku", `%${sku.slice(0, 6)}%`) // petit filet large
+          .limit(25);
 
-      if (!error && p) {
+        if (!errCand && Array.isArray(candidates)) {
+          const found = candidates.find((c: any) => normalizeSkuForSearch(String(c.sku || "")) === skuNorm);
+          if (found) p = found as any;
+        }
+      }
+
+      if (p) {
         productUrl = normalizeUrl(p.url);
 
         const priceStr =
@@ -98,9 +107,8 @@ if (!p) {
             ? `${p.price} ${p.currency || "EUR"}`
             : "N/A";
 
-        // payload: tu peux y mettre plein d’infos CMS (specs, compatibilités…)
         const payloadStr =
-          p.payload && typeof p.payload === "object" && Object.keys(p.payload).length > 0
+          p.payload && Object.keys(p.payload).length > 0
             ? `\nDonnées techniques (payload): ${JSON.stringify(p.payload)}`
             : "";
 
@@ -118,12 +126,13 @@ if (!p) {
       }
     }
 
+    // =========================
     // 2) RAG documents si pas de produit trouvé (ou pas de SKU)
+    // =========================
     let ragUsed = 0;
     let ragSources: RagSource[] = [];
     let docsContext = "";
 
-    // Si on a déjà le produit exact, les docs deviennent optionnels.
     const shouldUseDocs = !productContext;
 
     if (shouldUseDocs) {
@@ -146,37 +155,37 @@ if (!p) {
 
         ragSources = docs.map((d: any) => ({
           id: Number(d.id),
-          title: (d.title || d.source || undefined) as string | undefined,
-          url: normalizeUrl(d.url), // <- jamais null
-          similarity: toNumberOrUndefined(d.similarity),
+          title: d.title || d.source || undefined,
+          url: normalizeUrl(d.url),
+          similarity: typeof d.similarity === "number" ? d.similarity : undefined,
         }));
 
-        // Contexte court + clair
         const blocks = docs.map((d: any, idx: number) => {
           const title = d.title || d.source || `Doc ${idx + 1}`;
           const url = normalizeUrl(d.url);
-          const content = d.chunk || d.content || ""; // selon ton schéma
+          const content = d.chunk || d.content || "";
           return `---\n[DOC ${idx + 1}] ${title}\nURL: ${url || "N/A"}\nCONTENU:\n${content}\n`;
         });
 
         docsContext = `### Contexte CamProtect (documents)\n${blocks.join("\n")}\n`;
       }
     } else {
-      // Produit exact trouvé => on renvoie une source "produit"
+      // On a trouvé un produit exact -> on considère qu'on a 1 source interne fiable
       ragUsed = 1;
       ragSources = [
         {
           id: 0,
           title: "Produit CamProtect",
-          url: undefIfNull(productUrl),
+          url: productUrl,
           similarity: 1,
         },
       ];
     }
 
-    // 3) Appel OpenAI avec règles CamProtect-first
-    const context =
-      (productContext ? productContext + "\n" : "") + (docsContext ? docsContext : "");
+    // =========================
+    // 3) Appel IA avec contexte
+    // =========================
+    const context = (productContext ? productContext + "\n" : "") + (docsContext ? docsContext : "");
 
     const messages = [
       { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
@@ -184,7 +193,7 @@ if (!p) {
         role: "system" as const,
         content: context
           ? `Tu disposes du CONTEXTE ci-dessous. Utilise-le en priorité.\n\n${context}`
-          : `Aucun contexte interne trouvé. Dans ce cas, tu dois demander une précision et proposer des alternatives disponibles sur CamProtect.`,
+          : `Aucun contexte interne trouvé. Dans ce cas, tu demandes une précision et tu proposes des alternatives disponibles sur CamProtect.`,
       },
       { role: "user" as const, content: input },
     ];
