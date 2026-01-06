@@ -1,98 +1,129 @@
 // app/ai/api/admin/sync-product/route.ts
-
 import { supabaseAdmin } from "../../../../../lib/supabaseAdmin";
-import {
-  buildProductUrl,
-  getWebflowProductWithSkus,
-  priceToCents,
-} from "../../../../../lib/webflow";
+import { getWebflowProductWithSkus, webflowMoneyToNumber, buildCamprotectProductUrl } from "../../../../../lib/webflow";
 
 export const runtime = "nodejs";
 
-type SyncBody = {
-  productId: string; // Webflow product id
+type Body = {
+  webflowProductId: string; // ex: "6915ba34c737dbb25b00bb96"
 };
 
+function requireAdminToken(req: Request) {
+  const got = req.headers.get("x-admin-token") || "";
+  const expected = process.env.ADMIN_TOKEN || "";
+  if (!expected || got !== expected) {
+    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+  return null;
+}
+
 export async function POST(req: Request) {
+  const auth = requireAdminToken(req);
+  if (auth) return auth;
+
   try {
-    const body = (await req.json()) as SyncBody;
-    const productId = (body.productId || "").trim();
-    if (!productId) {
-      return Response.json({ ok: false, error: "Missing productId" }, { status: 400 });
+    const body = (await req.json()) as Body;
+    const webflowProductId = (body.webflowProductId || "").trim();
+    if (!webflowProductId) {
+      return Response.json({ ok: false, error: "Missing webflowProductId" }, { status: 400 });
     }
 
+    // 1) Fetch produit + SKUs (variantes) depuis Webflow (endpoint site-scoped)
+    const wf = await getWebflowProductWithSkus(webflowProductId);
+
+    const product = wf.product;
+    const productSlug = product.fieldData?.slug || null;
+    const productName = product.fieldData?.name || null;
+
+    const productUrl = buildCamprotectProductUrl(productSlug);
+
+    // 2) Upsert produit (table "products")
     const supa = supabaseAdmin();
-    const wf = await getWebflowProductWithSkus(productId);
 
-    const p = wf.product;
-    const fd = p.fieldData || {};
-    const slug = (fd.slug || "").trim();
-    if (!slug) {
-      return Response.json({ ok: false, error: "Webflow product has no slug" }, { status: 400 });
-    }
-
-    const productUrl = buildProductUrl(slug);
-
-    // 1) Upsert product
-    const productRow = {
-      webflow_product_id: p.id,
-      slug,
-      name: fd.name ?? null,
-      product_reference: fd["product-reference"] ?? null,
-      description: fd.description ?? null,
-      description_complete: fd["description-complete"] ?? null,
-      bullet_points: fd["bullet-point"] ?? null,
-      fiche_technique_url: fd["fiche-technique-du-produit"]?.url ?? null,
-      payload: fd,
-      updated_at: new Date().toISOString(),
-    };
-
-    const upProduct = await supa
+    const { data: upsertedProduct, error: upsertErr } = await supa
       .from("products")
-      .upsert(productRow, { onConflict: "webflow_product_id" })
-      .select("id, webflow_product_id, slug")
-      .single();
+      .upsert(
+        {
+          webflow_product_id: webflowProductId,
+          slug: productSlug,
+          name: productName,
+          url: productUrl,
+          // tu peux aussi mapper brand / product_reference etc si tu les as dans fieldData
+          payload: product.fieldData ?? {},
+        },
+        { onConflict: "webflow_product_id" }
+      )
+      .select("id, webflow_product_id, slug, url")
+      .maybeSingle();
 
-    if (upProduct.error) {
-      return Response.json({ ok: false, error: upProduct.error.message }, { status: 500 });
+    if (upsertErr) {
+      return Response.json(
+        { ok: false, error: "Supabase products upsert failed", details: upsertErr.message },
+        { status: 500 }
+      );
+    }
+    if (!upsertedProduct) {
+      return Response.json({ ok: false, error: "Product upsert returned null" }, { status: 500 });
     }
 
-    const dbProductId = upProduct.data.id;
+    // 3) Upsert variantes (table "product_variants")
+    // On suppose que tu as une table product_variants existante (tu as déjà confirmé qu’elle existe)
+    // Champs minimum conseillés: webflow_sku_id (unique), webflow_product_id, sku, name, slug, price, currency, url, option_values(jsonb), payload(jsonb)
+    let insertedVariants = 0;
 
-    // 2) Upsert variants
-    const defaultSkuId = fd["default-sku"] ?? null;
+    for (const s of wf.skus || []) {
+      const skuId = s.id;
+      const sku = s.fieldData?.sku || null;
+      const name = s.fieldData?.name || null;
+      const slug = s.fieldData?.slug || null;
+      const priceNum = webflowMoneyToNumber(s.fieldData?.price ?? null);
+      const currency = s.fieldData?.price?.unit || "EUR";
 
-    const variants = wf.skus.map((s) => {
-      const sfd = s.fieldData || {};
-      return {
-        webflow_sku_id: s.id,
-        product_id: dbProductId,
-        webflow_product_id: p.id,
-        sku: sfd.sku ?? null,
-        name: sfd.name ?? null,
-        price_cents: priceToCents(sfd.price ?? null),
-        currency: sfd.price?.unit ?? "EUR",
-        variant_values: sfd["sku-values"] ?? null,
-        is_default: defaultSkuId ? s.id === defaultSkuId : false,
-        image_url: sfd["main-image"]?.url ?? null,
-        updated_at: new Date().toISOString(),
-      };
-    });
+      // URL "produit" (pas forcément URL SKU). On garde l’URL produit principale.
+      const url = productUrl;
 
-    const upVariants = await supa
-      .from("product_variants")
-      .upsert(variants, { onConflict: "webflow_sku_id" });
+      const optionValues = s.fieldData?.["sku-values"] ?? null;
 
-    if (upVariants.error) {
-      return Response.json({ ok: false, error: upVariants.error.message }, { status: 500 });
+      const { error: vErr } = await supa
+        .from("product_variants")
+        .upsert(
+          {
+            webflow_sku_id: skuId,
+            webflow_product_id: webflowProductId,
+            sku,
+            name,
+            slug,
+            price: priceNum,
+            currency,
+            url,
+            option_values: optionValues,
+            payload: s.fieldData ?? {},
+          },
+          { onConflict: "webflow_sku_id" }
+        );
+
+      if (vErr) {
+        return Response.json(
+          { ok: false, error: "Supabase variants upsert failed", details: vErr.message },
+          { status: 500 }
+        );
+      }
+      insertedVariants += 1;
     }
 
     return Response.json({
       ok: true,
-      product: { id: p.id, slug, url: productUrl },
-      variants_count: variants.length,
+      webflowProductId,
+      product: {
+        slug: productSlug,
+        url: productUrl,
+      },
+      inserted_variants: insertedVariants,
     });
   } catch (e: any) {
-    return Response.json({ ok: false, error: e?.message || String(e) }, { status: 500 });
+    return Response.json(
+      { ok: false, error: "Internal error", details: e?.message || String(e) },
+      { status: 500 }
+    );
   }
 }
