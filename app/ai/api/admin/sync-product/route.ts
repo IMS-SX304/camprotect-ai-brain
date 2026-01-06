@@ -1,124 +1,182 @@
 // app/ai/api/admin/sync-product/route.ts
 import { supabaseAdmin } from "../../../../../lib/supabaseAdmin";
-import { getWebflowProductWithSkus, webflowMoneyToNumber, buildCamprotectProductUrl } from "../../../../../lib/webflow";
 
 export const runtime = "nodejs";
 
 type Body = {
-  webflowProductId: string; // ex: "6915ba34c737dbb25b00bb96"
+  webflowProductId: string;
 };
 
-function requireAdminToken(req: Request) {
+function requireEnv(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
+}
+
+function normalizeBaseUrl(u: string) {
+  // ex: https://www.camprotect.fr (sans slash final)
+  return u.replace(/\/+$/, "");
+}
+
+function priceFromWebflow(value: unknown): number | null {
+  // Webflow v2: price.value est souvent en centimes (int)
+  if (typeof value !== "number") return null;
+  return Math.round((value / 100) * 100) / 100; // 2 décimales
+}
+
+function isAdmin(req: Request) {
+  const adminToken = requireEnv("ADMIN_TOKEN");
   const got = req.headers.get("x-admin-token") || "";
-  const expected = process.env.ADMIN_TOKEN || "";
-  if (!expected || got !== expected) {
-    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  return got === adminToken;
+}
+
+async function webflowGet(path: string) {
+  const token = requireEnv("WEBFLOW_API_TOKEN");
+  const res = await fetch(`https://api.webflow.com/v2${path}`, {
+    method: "GET",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Webflow ${res.status}: ${text}`);
   }
-  return null;
+  return JSON.parse(text);
 }
 
 export async function POST(req: Request) {
-  const auth = requireAdminToken(req);
-  if (auth) return auth;
-
   try {
+    if (!isAdmin(req)) {
+      return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    }
+
     const body = (await req.json()) as Body;
     const webflowProductId = (body.webflowProductId || "").trim();
     if (!webflowProductId) {
       return Response.json({ ok: false, error: "Missing webflowProductId" }, { status: 400 });
     }
 
-    // 1) Fetch produit + SKUs (variantes) depuis Webflow (endpoint site-scoped)
-    const wf = await getWebflowProductWithSkus(webflowProductId);
-
-    const product = wf.product;
-    const productSlug = product.fieldData?.slug || null;
-    const productName = product.fieldData?.name || null;
-
-    const productUrl = buildCamprotectProductUrl(productSlug);
-
-    // 2) Upsert produit (table "products")
+    const baseUrl = normalizeBaseUrl(requireEnv("CAMPROTECT_BASE_URL")); // ex: https://www.camprotect.fr
     const supa = supabaseAdmin();
 
-    const { data: upsertedProduct, error: upsertErr } = await supa
-      .from("products")
-      .upsert(
-        {
-          webflow_product_id: webflowProductId,
-          slug: productSlug,
-          name: productName,
-          url: productUrl,
-          // tu peux aussi mapper brand / product_reference etc si tu les as dans fieldData
-          payload: product.fieldData ?? {},
-        },
-        { onConflict: "webflow_product_id" }
-      )
-      .select("id, webflow_product_id, slug, url")
-      .maybeSingle();
+    // 1) Récupération Webflow (produit + skus)
+    // Endpoint que tu utilises déjà : GET /v2/products/:id
+    const wf = await webflowGet(`/products/${encodeURIComponent(webflowProductId)}`);
 
-    if (upsertErr) {
+    const product = wf?.product;
+    const skus: any[] = Array.isArray(wf?.skus) ? wf.skus : [];
+
+    if (!product?.id) {
+      return Response.json({ ok: false, error: "Webflow product not found in response" }, { status: 404 });
+    }
+
+    const fieldData = product.fieldData || {};
+    const slug: string | undefined = fieldData.slug;
+    const name: string | undefined = fieldData.name;
+
+    const url = slug ? `${baseUrl}/product/${slug}` : null;
+
+    // Champs “métier” (adapte si tu veux mapper plus)
+    const brand =
+      typeof fieldData.fabricants === "string"
+        ? fieldData.fabricants
+        : (typeof fieldData.brand === "string" ? fieldData.brand : null);
+
+    const product_reference =
+      typeof fieldData["product-reference"] === "string"
+        ? fieldData["product-reference"]
+        : (typeof fieldData["code-fabricant"] === "string" ? fieldData["code-fabricant"] : null);
+
+    const product_type =
+      typeof fieldData["type-de-produit"] === "string" ? fieldData["type-de-produit"] : null;
+
+    const description =
+      typeof fieldData.description === "string"
+        ? fieldData.description
+        : (typeof fieldData["description-mini"] === "string" ? fieldData["description-mini"] : null);
+
+    // 2) Upsert product
+    const productRow = {
+      webflow_product_id: product.id as string,
+      slug: slug ?? null,
+      url,
+      name: name ?? null,
+      brand,
+      product_reference,
+      product_type,
+      description,
+      payload: fieldData, // on stocke tous les champs CMS ici (jsonb)
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data: upsertedProduct, error: upsertProdErr } = await supa
+      .from("products")
+      .upsert(productRow, { onConflict: "webflow_product_id" })
+      .select("id, webflow_product_id")
+      .single();
+
+    if (upsertProdErr || !upsertedProduct) {
       return Response.json(
-        { ok: false, error: "Supabase products upsert failed", details: upsertErr.message },
+        { ok: false, error: "Supabase products upsert failed", details: upsertProdErr?.message || "no row" },
         { status: 500 }
       );
     }
-    if (!upsertedProduct) {
-      return Response.json({ ok: false, error: "Product upsert returned null" }, { status: 500 });
-    }
 
-    // 3) Upsert variantes (table "product_variants")
-    // On suppose que tu as une table product_variants existante (tu as déjà confirmé qu’elle existe)
-    // Champs minimum conseillés: webflow_sku_id (unique), webflow_product_id, sku, name, slug, price, currency, url, option_values(jsonb), payload(jsonb)
-    let insertedVariants = 0;
+    const productId = upsertedProduct.id as number;
 
-    for (const s of wf.skus || []) {
-      const skuId = s.id;
-      const sku = s.fieldData?.sku || null;
-      const name = s.fieldData?.name || null;
-      const slug = s.fieldData?.slug || null;
-      const priceNum = webflowMoneyToNumber(s.fieldData?.price ?? null);
-      const currency = s.fieldData?.price?.unit || "EUR";
+    // 3) Upsert variants (SKUs)
+    const variantsRows = skus.map((s: any) => {
+      const fd = s?.fieldData || {};
+      const priceValue = fd?.price?.value;
+      const currency = fd?.price?.unit || "EUR";
 
-      // URL "produit" (pas forcément URL SKU). On garde l’URL produit principale.
-      const url = productUrl;
+      // option_values = mapping "sku-values" => ids de choix
+      const optionValues = fd?.["sku-values"] || null;
 
-      const optionValues = s.fieldData?.["sku-values"] ?? null;
+      const mainImageUrl =
+        typeof fd?.["main-image"]?.url === "string" ? fd["main-image"].url : null;
 
-      const { error: vErr } = await supa
+      // SKU “marchand” (celui que les clients cherchent)
+      const sku = typeof fd?.sku === "string" ? fd.sku : null;
+
+      return {
+        product_id: productId,
+        webflow_sku_id: s.id as string,
+        sku,
+        name: typeof fd?.name === "string" ? fd.name : null,
+        slug: typeof fd?.slug === "string" ? fd.slug : null,
+        price: priceFromWebflow(priceValue),
+        currency: typeof currency === "string" ? currency : "EUR",
+        option_values: optionValues, // JSONB
+        is_default: (product?.fieldData?.["default-sku"] === s.id) || false,
+        main_image_url: mainImageUrl,
+        updated_at: new Date().toISOString(),
+      };
+    });
+
+    if (variantsRows.length > 0) {
+      const { error: upsertVarErr } = await supa
         .from("product_variants")
-        .upsert(
-          {
-            webflow_sku_id: skuId,
-            webflow_product_id: webflowProductId,
-            sku,
-            name,
-            slug,
-            price: priceNum,
-            currency,
-            url,
-            option_values: optionValues,
-            payload: s.fieldData ?? {},
-          },
-          { onConflict: "webflow_sku_id" }
-        );
+        .upsert(variantsRows, { onConflict: "webflow_sku_id" });
 
-      if (vErr) {
+      if (upsertVarErr) {
         return Response.json(
-          { ok: false, error: "Supabase variants upsert failed", details: vErr.message },
+          { ok: false, error: "Supabase variants upsert failed", details: upsertVarErr.message },
           { status: 500 }
         );
       }
-      insertedVariants += 1;
     }
 
     return Response.json({
       ok: true,
       webflowProductId,
-      product: {
-        slug: productSlug,
-        url: productUrl,
-      },
-      inserted_variants: insertedVariants,
+      supabaseProductId: productId,
+      inserted_variants: variantsRows.length,
+      url,
     });
   } catch (e: any) {
     return Response.json(
