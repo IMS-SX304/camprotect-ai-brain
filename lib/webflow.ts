@@ -1,69 +1,39 @@
 // lib/webflow.ts
-
-type WebflowPrice = { value: number; unit: string };
-type WebflowSku = {
-  id: string;
-  fieldData?: {
-    price?: WebflowPrice | null;
-    sku?: string | null;
-    name?: string | null;
-    slug?: string | null;
-    "sku-values"?: Record<string, string> | null;
-  };
+export type WebflowMoney = {
+  value: number; // en "minor units" (ex: centimes)
+  unit?: string; // ex: "EUR"
+  currency?: string; // parfois présent
 };
 
-type WebflowProduct = {
-  id: string;
-  fieldData?: {
-    slug?: string | null;
-    name?: string | null;
-  };
-};
+export function moneyToNumber(m?: WebflowMoney | null): number | null {
+  if (!m || typeof m.value !== "number") return null;
 
-type WebflowGetProductResponse = {
-  product: WebflowProduct;
-  skus: WebflowSku[];
-};
+  // Webflow renvoie généralement en centimes pour EUR/USD => 2 décimales
+  // Pour être plus robuste : quelques monnaies sans décimales
+  const c = (m.currency || m.unit || "").toUpperCase();
+  const zeroDecimal = new Set(["JPY", "KRW", "VND", "CLP", "ISK"]);
+  const divisor = zeroDecimal.has(c) ? 1 : 100;
 
-async function webflowFetch(path: string) {
+  return Number((m.value / divisor).toFixed(zeroDecimal.has(c) ? 0 : 2));
+}
+
+export async function webflowJson(path: string, init?: RequestInit) {
   const token = process.env.WEBFLOW_API_TOKEN;
   if (!token) throw new Error("Missing WEBFLOW_API_TOKEN");
 
-  const res = await fetch(`https://api.webflow.com${path}`, {
-    method: "GET",
+  // IMPORTANT: base v2
+  const url = `https://api.webflow.com/v2${path}`;
+
+  const res = await fetch(url, {
+    ...init,
     headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      ...(init?.headers || {}),
     },
   });
 
   const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`Webflow ${res.status}: ${text}`);
-  }
-  return JSON.parse(text);
-}
-
-/**
- * Récupère un produit e-commerce + ses SKUs (variantes) via Data API v2
- * Endpoint: /v2/sites/:site_id/products/:product_id
- */
-export async function getWebflowProductWithSkus(productId: string): Promise<WebflowGetProductResponse> {
-  const siteId = process.env.WEBFLOW_SITE_ID;
-  if (!siteId) throw new Error("Missing WEBFLOW_SITE_ID");
-
-  // ✅ Endpoint correct (site-scoped)
-  return webflowFetch(`/v2/sites/${siteId}/products/${productId}`);
-}
-
-/** Webflow renvoie le prix en centimes: 24354 -> 243.54 */
-export function webflowMoneyToNumber(price?: WebflowPrice | null): number | null {
-  if (!price || typeof price.value !== "number") return null;
-  return price.value / 100;
-}
-
-export function buildCamprotectProductUrl(slug?: string | null): string | null {
-  if (!slug) return null;
-  const base = process.env.CAMPROTECT_BASE_URL || "https://www.camprotect.fr";
-  return `${base.replace(/\/$/, "")}/product/${slug}`;
+  if (!res.ok) throw new Error(`Webflow ${res.status}: ${text}`);
+  return text ? JSON.parse(text) : null;
 }
