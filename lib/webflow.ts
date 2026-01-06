@@ -1,57 +1,69 @@
 // lib/webflow.ts
 
-const WEBFLOW_API_BASE = "https://api.webflow.com/v2";
+type WebflowPrice = { value: number; unit: string };
+type WebflowSku = {
+  id: string;
+  fieldData?: {
+    price?: WebflowPrice | null;
+    sku?: string | null;
+    name?: string | null;
+    slug?: string | null;
+    "sku-values"?: Record<string, string> | null;
+  };
+};
 
-function mustEnv(name: string) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
-}
+type WebflowProduct = {
+  id: string;
+  fieldData?: {
+    slug?: string | null;
+    name?: string | null;
+  };
+};
 
-export function buildProductUrl(slug: string) {
-  const base = (process.env.CAMPROTECT_BASE_URL || "https://www.camprotect.fr").replace(/\/$/, "");
-  return `${base}/product/${slug}`;
-}
+type WebflowGetProductResponse = {
+  product: WebflowProduct;
+  skus: WebflowSku[];
+};
 
 async function webflowFetch(path: string) {
-  const token = mustEnv("WEBFLOW_API_TOKEN");
-  const res = await fetch(`${WEBFLOW_API_BASE}${path}`, {
+  const token = process.env.WEBFLOW_API_TOKEN;
+  if (!token) throw new Error("Missing WEBFLOW_API_TOKEN");
+
+  const res = await fetch(`https://api.webflow.com${path}`, {
     method: "GET",
     headers: {
       Authorization: `Bearer ${token}`,
-      "content-type": "application/json",
+      "Content-Type": "application/json",
     },
-    // Important en runtime nodejs
-    cache: "no-store",
   });
 
   const text = await res.text();
-  if (!res.ok) throw new Error(`Webflow ${res.status}: ${text}`);
+  if (!res.ok) {
+    throw new Error(`Webflow ${res.status}: ${text}`);
+  }
   return JSON.parse(text);
 }
 
 /**
- * Convertit un objet Webflow price { value: 24354, unit: "EUR" }
- * en centimes (int). Si nul, retourne null.
+ * Récupère un produit e-commerce + ses SKUs (variantes) via Data API v2
+ * Endpoint: /v2/sites/:site_id/products/:product_id
  */
-export function priceToCents(price: any): number | null {
-  if (!price) return null;
-  const v = price.value;
-  if (typeof v === "number") return Math.trunc(v); // Webflow est déjà en "centimes" dans ton JSON
-  if (typeof v === "string" && v.trim() !== "") return Math.trunc(Number(v));
-  return null;
+export async function getWebflowProductWithSkus(productId: string): Promise<WebflowGetProductResponse> {
+  const siteId = process.env.WEBFLOW_SITE_ID;
+  if (!siteId) throw new Error("Missing WEBFLOW_SITE_ID");
+
+  // ✅ Endpoint correct (site-scoped)
+  return webflowFetch(`/v2/sites/${siteId}/products/${productId}`);
 }
 
-/**
- * GET product + skus: /v2/products/:id
- * Retour attendu : { product: {...}, skus: [...] }
- */
-export async function getWebflowProductWithSkus(productId: string): Promise<{
-  product: any;
-  skus: any[];
-}> {
-  const data = await webflowFetch(`/products/${productId}`);
-  // Webflow renvoie bien { product, skus }
-  if (!data?.product) throw new Error("Webflow response missing 'product'");
-  return { product: data.product, skus: Array.isArray(data.skus) ? data.skus : [] };
+/** Webflow renvoie le prix en centimes: 24354 -> 243.54 */
+export function webflowMoneyToNumber(price?: WebflowPrice | null): number | null {
+  if (!price || typeof price.value !== "number") return null;
+  return price.value / 100;
+}
+
+export function buildCamprotectProductUrl(slug?: string | null): string | null {
+  if (!slug) return null;
+  const base = process.env.CAMPROTECT_BASE_URL || "https://www.camprotect.fr";
+  return `${base.replace(/\/$/, "")}/product/${slug}`;
 }
