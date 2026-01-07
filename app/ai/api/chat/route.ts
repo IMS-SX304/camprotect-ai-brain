@@ -8,20 +8,30 @@ type ChatBody = {
   input: string;
   conversationId?: string;
   topK?: number;
+  debug?: boolean;
 };
 
 type RagSource = {
   id: number;
   title?: string;
-  url?: string; // jamais null
+  url?: string;
   similarity?: number;
 };
 
 function extractSku(text: string): string | null {
-  // Ex: DS-7616NXI-I2-S, DS-7616NXI-I2/S, NVR4104HS-4KS3, 52271.146.WH1, etc.
+  // Match refs type DS-7616NXI-I2-S, DS-7616NXI-I2/S, 52271.146.WH1, NVR4104HS-4KS3...
   const m = text.match(/[A-Z0-9]{2,}([-.\/][A-Z0-9]{1,}){1,10}/i);
-  if (!m) return null;
-  return m[0].toUpperCase();
+  return m ? m[0].toUpperCase() : null;
+}
+
+function skuCandidates(sku: string): string[] {
+  const s = sku.toUpperCase().trim();
+  const c1 = s;
+  const c2 = s.replace(/\//g, "-");
+  const c3 = s.replace(/-/g, "/");
+  // version "compacte" (au cas où stocké sans séparateurs)
+  const c4 = s.replace(/[^A-Z0-9]/g, "");
+  return Array.from(new Set([c1, c2, c3, c4])).filter(Boolean);
 }
 
 function normalizeUrl(u?: string | null): string | undefined {
@@ -30,8 +40,7 @@ function normalizeUrl(u?: string | null): string | undefined {
   if (!trimmed) return undefined;
 
   try {
-    const url = new URL(trimmed);
-    return url.toString();
+    return new URL(trimmed).toString();
   } catch {
     if (trimmed.startsWith("/")) return `https://www.camprotect.fr${trimmed}`;
     return `https://www.camprotect.fr/${trimmed.replace(/^https?:\/\//, "")}`;
@@ -53,16 +62,6 @@ function moneyToString(price: any, currency?: any): string {
   return `${n} ${c}`;
 }
 
-function skuCandidates(sku: string): string[] {
-  // Permet de matcher DS-7616NXI-I2/S vs DS-7616NXI-I2-S
-  const s = sku.toUpperCase().trim();
-  const a = s;
-  const b = s.replace(/\//g, "-");
-  const c = s.replace(/-/g, "/");
-  // unique
-  return Array.from(new Set([a, b, c])).filter(Boolean);
-}
-
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as ChatBody;
@@ -74,61 +73,130 @@ export async function POST(req: Request) {
 
     const topK = body.topK ?? 6;
     const conversationId = body.conversationId ?? crypto.randomUUID();
+    const debugMode = !!body.debug;
 
     const supa = supabaseAdmin();
 
+    const debug: any = {
+      input,
+      extractedSku: null as string | null,
+      skuCandidates: [] as string[],
+      lookup: {
+        exact_product_reference: null as any,
+        ilike_product_reference: null as any,
+        ilike_slug: null as any,
+        ilike_name: null as any,
+      },
+      supabaseErrors: [] as string[],
+    };
+
     // ------------------------------------------------------------
-    // 1) Lookup produit direct si SKU détecté
-    //    IMPORTANT: chez toi la référence est dans products.product_reference
+    // 1) Lookup produit
     // ------------------------------------------------------------
     const sku = extractSku(input);
+    debug.extractedSku = sku;
+
     let productContext = "";
     let productUrl: string | undefined;
 
     if (sku) {
       const candidates = skuCandidates(sku);
+      debug.skuCandidates = candidates;
 
-      // On tente match exact sur product_reference (et slug si jamais)
-      // => or() permet d’essayer plusieurs valeurs
-      const orParts: string[] = [];
+      // 1A) exact match product_reference
       for (const c of candidates) {
-        orParts.push(`product_reference.eq.${c}`);
-        orParts.push(`slug.eq.${c.toLowerCase()}`);
+        const { data, error } = await supa
+          .from("products")
+          .select("*")
+          .eq("product_reference", c)
+          .limit(1)
+          .maybeSingle();
+
+        if (error) debug.supabaseErrors.push(`exact product_reference ${c}: ${error.message}`);
+        if (data) {
+          debug.lookup.exact_product_reference = { matched: c, id: data.id };
+          const p = data as any;
+          productUrl = normalizeUrl(p.url) || buildProductUrlFromSlug(p.slug);
+
+          const priceStr = moneyToString(p.price, p.currency);
+          const ref = p.product_reference || sku;
+
+          productContext =
+            `### Produit CamProtect (source de vérité)\n` +
+            `Référence: ${ref}\n` +
+            `Nom: ${p.name || "N/A"}\n` +
+            `Marque: ${p.brand || "N/A"}\n` +
+            `Type: ${p.product_type || p.type || "N/A"}\n` +
+            `Prix: ${priceStr}\n` +
+            `Lien CamProtect: ${productUrl || "N/A"}\n` +
+            `Description: ${p.description || p.description_complete || p.description_mini || "N/A"}\n`;
+
+          break;
+        }
       }
 
-      // NOTE: select("*") évite les erreurs si tes colonnes évoluent
-      const { data: p, error: pErr } = await supa
-        .from("products")
-        .select("*")
-        .or(orParts.join(","))
-        .limit(1)
-        .maybeSingle();
+      // 1B) fallback: ilike sur product_reference (si stocké différemment)
+      if (!productContext) {
+        const needle = candidates[0];
+        const { data, error } = await supa
+          .from("products")
+          .select("*")
+          .ilike("product_reference", `%${needle}%`)
+          .limit(1)
+          .maybeSingle();
 
-      if (!pErr && p) {
-        // URL priorité: colonne url -> sinon base + slug
-        productUrl = normalizeUrl(p.url) || buildProductUrlFromSlug(p.slug);
+        if (error) debug.supabaseErrors.push(`ilike product_reference %${needle}%: ${error.message}`);
+        if (data) {
+          debug.lookup.ilike_product_reference = { needle, id: data.id };
+          const p = data as any;
+          productUrl = normalizeUrl(p.url) || buildProductUrlFromSlug(p.slug);
 
-        // prix: si tu as un champ price/currency dans products, on l’utilise
-        const priceStr = moneyToString(p.price, p.currency);
+          productContext =
+            `### Produit CamProtect (source de vérité)\n` +
+            `Référence: ${p.product_reference || sku}\n` +
+            `Nom: ${p.name || "N/A"}\n` +
+            `Marque: ${p.brand || "N/A"}\n` +
+            `Type: ${p.product_type || p.type || "N/A"}\n` +
+            `Prix: ${moneyToString(p.price, p.currency)}\n` +
+            `Lien CamProtect: ${productUrl || "N/A"}\n` +
+            `Description: ${p.description || p.description_complete || p.description_mini || "N/A"}\n`;
+        }
+      }
 
-        const payloadStr =
-          p.payload && typeof p.payload === "object" && Object.keys(p.payload).length > 0
-            ? `\nDonnées techniques (payload): ${JSON.stringify(p.payload)}`
-            : "";
+      // 1C) fallback slug / name ilike
+      if (!productContext) {
+        const needle = candidates[0].toLowerCase();
 
-        const ref = p.product_reference || p.sku || sku;
+        const q1 = await supa.from("products").select("*").ilike("slug", `%${needle}%`).limit(1).maybeSingle();
+        if (q1.error) debug.supabaseErrors.push(`ilike slug %${needle}%: ${q1.error.message}`);
+        if (q1.data) {
+          debug.lookup.ilike_slug = { needle, id: q1.data.id };
+          const p: any = q1.data;
+          productUrl = normalizeUrl(p.url) || buildProductUrlFromSlug(p.slug);
+          productContext =
+            `### Produit CamProtect (source de vérité)\n` +
+            `Référence: ${p.product_reference || sku}\n` +
+            `Nom: ${p.name || "N/A"}\n` +
+            `Marque: ${p.brand || "N/A"}\n` +
+            `Lien CamProtect: ${productUrl || "N/A"}\n`;
+        }
+      }
 
-        productContext =
-          `### Produit CamProtect (source de vérité)\n` +
-          `Référence: ${ref}\n` +
-          `Nom: ${p.name || "N/A"}\n` +
-          `Marque: ${p.brand || "N/A"}\n` +
-          `Type: ${p.product_type || p.type || "N/A"}\n` +
-          `Prix: ${priceStr}\n` +
-          `Lien CamProtect: ${productUrl || "N/A"}\n` +
-          `Description: ${p.description || p.description_complete || p.description_mini || "N/A"}\n` +
-          payloadStr +
-          `\n`;
+      if (!productContext) {
+        const needle = candidates[0];
+        const q2 = await supa.from("products").select("*").ilike("name", `%${needle}%`).limit(1).maybeSingle();
+        if (q2.error) debug.supabaseErrors.push(`ilike name %${needle}%: ${q2.error.message}`);
+        if (q2.data) {
+          debug.lookup.ilike_name = { needle, id: q2.data.id };
+          const p: any = q2.data;
+          productUrl = normalizeUrl(p.url) || buildProductUrlFromSlug(p.slug);
+          productContext =
+            `### Produit CamProtect (source de vérité)\n` +
+            `Référence: ${p.product_reference || sku}\n` +
+            `Nom: ${p.name || "N/A"}\n` +
+            `Marque: ${p.brand || "N/A"}\n` +
+            `Lien CamProtect: ${productUrl || "N/A"}\n`;
+        }
       }
     }
 
@@ -139,11 +207,8 @@ export async function POST(req: Request) {
     let ragSources: RagSource[] = [];
     let docsContext = "";
 
-    const shouldUseDocs = !productContext;
-
-    if (shouldUseDocs) {
+    if (!productContext) {
       const embedding = await embedText(input);
-
       const { data: docs, error: rpcErr } = await supa.rpc("match_documents", {
         query_embedding: embedding,
         match_count: topK,
@@ -151,7 +216,7 @@ export async function POST(req: Request) {
 
       if (rpcErr) {
         return Response.json(
-          { ok: false, error: "Supabase match_documents failed", details: rpcErr.message },
+          { ok: false, error: "Supabase match_documents failed", details: rpcErr.message, debug: debugMode ? debug : undefined },
           { status: 500 }
         );
       }
@@ -177,16 +242,13 @@ export async function POST(req: Request) {
       }
     } else {
       ragUsed = 1;
-      ragSources = [
-        { id: 0, title: "Produit CamProtect", url: productUrl, similarity: 1 },
-      ];
+      ragSources = [{ id: 0, title: "Produit CamProtect", url: productUrl, similarity: 1 }];
     }
 
     // ------------------------------------------------------------
     // 3) IA
     // ------------------------------------------------------------
-    const context =
-      (productContext ? productContext + "\n" : "") + (docsContext ? docsContext : "");
+    const context = (productContext ? productContext + "\n" : "") + (docsContext ? docsContext : "");
 
     const messages = [
       { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
@@ -194,7 +256,7 @@ export async function POST(req: Request) {
         role: "system" as const,
         content: context
           ? `Tu disposes du CONTEXTE ci-dessous. Utilise-le en priorité.\n\n${context}`
-          : `Aucun contexte interne trouvé. Tu dois demander une précision utile et proposer des alternatives disponibles sur CamProtect.`,
+          : `Aucun contexte interne trouvé. Demande une précision utile et propose des alternatives disponibles sur CamProtect.`,
       },
       { role: "user" as const, content: input },
     ];
@@ -206,6 +268,7 @@ export async function POST(req: Request) {
       conversationId,
       reply,
       rag: { used: ragUsed, sources: ragSources },
+      debug: debugMode ? debug : undefined,
     });
   } catch (e: any) {
     return Response.json(
