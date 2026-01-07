@@ -30,22 +30,21 @@ export async function POST(req: Request) {
   const siteId = process.env.WEBFLOW_SITE_ID;
   if (!siteId) {
     return Response.json({ ok: false, error: "Missing WEBFLOW_SITE_ID" }, { status: 500 });
-    }
+  }
+
   const sb = supabaseAdmin();
 
   const limit = 250;
   let offset = 0;
-  let totalUpsertedProducts = 0;
-  let totalUpsertedVariants = 0;
+  let productsUpserted = 0;
+  let variantsUpserted = 0;
 
   try {
     while (true) {
-      // 1) liste produits (page)
       const list = await webflowJson(`/sites/${siteId}/products?offset=${offset}&limit=${limit}`);
       const items = Array.isArray(list?.items) ? list.items : [];
       if (items.length === 0) break;
 
-      // 2) pour chaque produit, on récupère le détail (inclut skus/prix/slug etc.)
       for (const it of items) {
         const productId = it?.product?.id;
         if (!productId) continue;
@@ -53,11 +52,10 @@ export async function POST(req: Request) {
         const detail = await webflowJson(`/sites/${siteId}/products/${productId}`);
         const product = detail?.product;
         const skus = Array.isArray(detail?.skus) ? detail.skus : [];
-
         const fd = product?.fieldData || {};
-        const slug = fd?.slug || product?.slug || null;
+        const slug = fd?.slug ?? product?.slug ?? null;
 
-        const row = {
+        const productRow = {
           webflow_product_id: product?.id ?? productId,
           slug,
           name: fd?.name ?? null,
@@ -75,9 +73,9 @@ export async function POST(req: Request) {
           last_updated: product?.lastUpdated ?? null,
         };
 
-        const upProd = await sb
-          .from("products")
-          .upsert(row, { onConflict: "webflow_product_id" });
+        const upProd = await sb.from("products").upsert(productRow, {
+          onConflict: "webflow_product_id",
+        });
 
         if (upProd.error) {
           return Response.json(
@@ -85,20 +83,20 @@ export async function POST(req: Request) {
             { status: 500 }
           );
         }
-        totalUpsertedProducts += 1;
+        productsUpserted += 1;
 
-        // 3) variantes
         for (const s of skus) {
           const sfd = s?.fieldData || {};
-          const skuSlug = sfd?.slug ?? null;
+          const skuId = s?.id ?? null;
+          if (!skuId) continue;
 
           const vRow = {
             webflow_product_id: product?.id ?? productId,
-            webflow_sku_id: s?.id ?? null,
+            webflow_sku_id: skuId,
             sku: sfd?.sku ?? null,
             name: sfd?.name ?? null,
-            slug: skuSlug,
-            url: productUrlFromSlug(slug), // URL page produit (pas la page variante)
+            slug: sfd?.slug ?? null,
+            url: productUrlFromSlug(slug), // URL page produit
             price: moneyToNumber(sfd?.price) ?? null,
             currency: (sfd?.price?.unit || sfd?.price?.currency || null) as string | null,
             option_values: sfd?.["sku-values"] ?? null,
@@ -106,11 +104,9 @@ export async function POST(req: Request) {
             updated_at: new Date().toISOString(),
           };
 
-          if (!vRow.webflow_sku_id) continue;
-
-          const upVar = await sb
-            .from("product_variants")
-            .upsert(vRow, { onConflict: "webflow_sku_id" });
+          const upVar = await sb.from("product_variants").upsert(vRow, {
+            onConflict: "webflow_sku_id",
+          });
 
           if (upVar.error) {
             return Response.json(
@@ -118,7 +114,7 @@ export async function POST(req: Request) {
               { status: 500 }
             );
           }
-          totalUpsertedVariants += 1;
+          variantsUpserted += 1;
         }
       }
 
@@ -127,11 +123,13 @@ export async function POST(req: Request) {
 
     return Response.json({
       ok: true,
-      productsUpserted: totalUpsertedProducts,
-      variantsUpserted: totalUpsertedVariants,
-      nextOffset: offset,
+      productsUpserted,
+      variantsUpserted,
     });
   } catch (e: any) {
-    return Response.json({ ok: false, error: "Internal error", details: String(e?.message || e) }, { status: 500 });
+    return Response.json(
+      { ok: false, error: "Internal error", details: String(e?.message || e) },
+      { status: 500 }
+    );
   }
 }
