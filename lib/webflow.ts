@@ -8,8 +8,9 @@ export type WebflowMoney = {
 
 export function moneyToNumber(m?: WebflowMoney | null): number | null {
   if (!m || typeof m.value !== "number") return null;
+  const c = String(m.currency || m.unit || "").toUpperCase();
 
-  const c = (m.currency || m.unit || "EUR").toUpperCase();
+  // monnaies sans décimales (au cas où)
   const zeroDecimal = new Set(["JPY", "KRW", "VND", "CLP", "ISK"]);
   const divisor = zeroDecimal.has(c) ? 1 : 100;
 
@@ -21,27 +22,20 @@ export async function webflowJson(path: string, init: RequestInit = {}) {
   if (!token) throw new Error("Missing WEBFLOW_API_TOKEN");
 
   const url = `https://api.webflow.com/v2${path}`;
-
   const res = await fetch(url, {
     ...init,
     headers: {
       accept: "application/json",
-      "content-type": "application/json",
-      Authorization: `Bearer ${token}`,
+      authorization: `Bearer ${token}`,
       ...(init.headers || {}),
     },
+    // Important en Next route handlers
+    cache: "no-store",
   });
 
   const text = await res.text();
-  if (!res.ok) throw new Error(`Webflow ${res.status}: ${text}`);
+  if (!res.ok) {
+    throw new Error(`Webflow ${res.status}: ${text}`);
+  }
   return text ? JSON.parse(text) : null;
-}
-
-export async function webflowListProducts(siteId: string, offset = 0, limit = 100) {
-  return webflowJson(`/sites/${siteId}/products?offset=${offset}&limit=${limit}`, { method: "GET" });
-}
-
-export async function webflowGetProduct(siteId: string, productId: string) {
-  // IMPORTANT: endpoint correct = /v2/sites/{siteId}/products/{productId}
-  return webflowJson(`/sites/${siteId}/products/${productId}`, { method: "GET" });
 }
