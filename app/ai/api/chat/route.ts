@@ -13,42 +13,54 @@ type ChatBody = {
 type RagSource = {
   id: number;
   title?: string;
-  url?: string; // IMPORTANT: string | undefined (pas null)
+  url?: string; // jamais null
   similarity?: number;
 };
 
 function extractSku(text: string): string | null {
-  // Ex: DS-7616NXI-I2-S, NVR4104HS-4KS3, 52271.146.WH1 etc.
-  // On capte des patterns alphanum + séparateurs - . /
-  const m = text.match(/[A-Z0-9]{2,}([-.\/][A-Z0-9]{2,}){1,6}/i);
+  // Ex: DS-7616NXI-I2-S, DS-7616NXI-I2/S, NVR4104HS-4KS3, 52271.146.WH1, etc.
+  const m = text.match(/[A-Z0-9]{2,}([-.\/][A-Z0-9]{1,}){1,10}/i);
   if (!m) return null;
   return m[0].toUpperCase();
 }
 
 function normalizeUrl(u?: string | null): string | undefined {
-  // Retourne string | undefined (jamais null)
   if (!u) return undefined;
-
   const trimmed = String(u).trim();
   if (!trimmed) return undefined;
 
   try {
-    // déjà absolute
     const url = new URL(trimmed);
     return url.toString();
   } catch {
-    // relative -> camprotect.fr
     if (trimmed.startsWith("/")) return `https://www.camprotect.fr${trimmed}`;
     return `https://www.camprotect.fr/${trimmed.replace(/^https?:\/\//, "")}`;
   }
 }
 
-function moneyToString(price: any, currency?: string | null): string {
+function buildProductUrlFromSlug(slug?: string | null): string | undefined {
+  if (!slug) return undefined;
+  const s = String(slug).trim();
+  if (!s) return undefined;
+  return `https://www.camprotect.fr/product/${s}`;
+}
+
+function moneyToString(price: any, currency?: any): string {
   if (price === null || price === undefined) return "N/A";
-  // price peut être number (ex: 399) ou string
   const n = typeof price === "number" ? price : Number(price);
   if (Number.isNaN(n)) return "N/A";
-  return `${n} ${(currency || "EUR").toUpperCase()}`;
+  const c = (currency || "EUR").toString().toUpperCase();
+  return `${n} ${c}`;
+}
+
+function skuCandidates(sku: string): string[] {
+  // Permet de matcher DS-7616NXI-I2/S vs DS-7616NXI-I2-S
+  const s = sku.toUpperCase().trim();
+  const a = s;
+  const b = s.replace(/\//g, "-");
+  const c = s.replace(/-/g, "/");
+  // unique
+  return Array.from(new Set([a, b, c])).filter(Boolean);
 }
 
 export async function POST(req: Request) {
@@ -66,22 +78,37 @@ export async function POST(req: Request) {
     const supa = supabaseAdmin();
 
     // ------------------------------------------------------------
-    // 1) Priorité: lookup produit direct si SKU détecté
+    // 1) Lookup produit direct si SKU détecté
+    //    IMPORTANT: chez toi la référence est dans products.product_reference
     // ------------------------------------------------------------
     const sku = extractSku(input);
-
     let productContext = "";
-    let productUrl: string | undefined = undefined;
+    let productUrl: string | undefined;
 
     if (sku) {
+      const candidates = skuCandidates(sku);
+
+      // On tente match exact sur product_reference (et slug si jamais)
+      // => or() permet d’essayer plusieurs valeurs
+      const orParts: string[] = [];
+      for (const c of candidates) {
+        orParts.push(`product_reference.eq.${c}`);
+        orParts.push(`slug.eq.${c.toLowerCase()}`);
+      }
+
+      // NOTE: select("*") évite les erreurs si tes colonnes évoluent
       const { data: p, error: pErr } = await supa
         .from("products")
-        .select("id,sku,name,brand,product_type,url,price,currency,description,payload")
-        .eq("sku", sku)
+        .select("*")
+        .or(orParts.join(","))
+        .limit(1)
         .maybeSingle();
 
       if (!pErr && p) {
-        productUrl = normalizeUrl(p.url);
+        // URL priorité: colonne url -> sinon base + slug
+        productUrl = normalizeUrl(p.url) || buildProductUrlFromSlug(p.slug);
+
+        // prix: si tu as un champ price/currency dans products, on l’utilise
         const priceStr = moneyToString(p.price, p.currency);
 
         const payloadStr =
@@ -89,22 +116,24 @@ export async function POST(req: Request) {
             ? `\nDonnées techniques (payload): ${JSON.stringify(p.payload)}`
             : "";
 
+        const ref = p.product_reference || p.sku || sku;
+
         productContext =
           `### Produit CamProtect (source de vérité)\n` +
-          `SKU: ${p.sku}\n` +
+          `Référence: ${ref}\n` +
           `Nom: ${p.name || "N/A"}\n` +
           `Marque: ${p.brand || "N/A"}\n` +
-          `Type: ${p.product_type || "N/A"}\n` +
+          `Type: ${p.product_type || p.type || "N/A"}\n` +
           `Prix: ${priceStr}\n` +
           `Lien CamProtect: ${productUrl || "N/A"}\n` +
-          `Description: ${p.description || "N/A"}\n` +
+          `Description: ${p.description || p.description_complete || p.description_mini || "N/A"}\n` +
           payloadStr +
           `\n`;
       }
     }
 
     // ------------------------------------------------------------
-    // 2) RAG docs si pas de produit trouvé
+    // 2) RAG docs si pas trouvé
     // ------------------------------------------------------------
     let ragUsed = 0;
     let ragSources: RagSource[] = [];
@@ -149,21 +178,15 @@ export async function POST(req: Request) {
     } else {
       ragUsed = 1;
       ragSources = [
-        {
-          id: 0,
-          title: "Produit CamProtect",
-          url: productUrl, // string|undefined OK
-          similarity: 1,
-        },
+        { id: 0, title: "Produit CamProtect", url: productUrl, similarity: 1 },
       ];
     }
 
     // ------------------------------------------------------------
-    // 3) Appel IA (CamProtect-first)
+    // 3) IA
     // ------------------------------------------------------------
     const context =
-      (productContext ? productContext + "\n" : "") +
-      (docsContext ? docsContext : "");
+      (productContext ? productContext + "\n" : "") + (docsContext ? docsContext : "");
 
     const messages = [
       { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
@@ -171,7 +194,7 @@ export async function POST(req: Request) {
         role: "system" as const,
         content: context
           ? `Tu disposes du CONTEXTE ci-dessous. Utilise-le en priorité.\n\n${context}`
-          : `Aucun contexte interne trouvé. Dans ce cas, tu dois:\n- demander une précision utile (marque, référence, usage)\n- proposer des alternatives disponibles sur CamProtect\n- éviter d’envoyer l’utilisateur vers d’autres sites`,
+          : `Aucun contexte interne trouvé. Tu dois demander une précision utile et proposer des alternatives disponibles sur CamProtect.`,
       },
       { role: "user" as const, content: input },
     ];
