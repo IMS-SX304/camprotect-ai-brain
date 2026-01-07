@@ -50,10 +50,7 @@ export async function POST(req: Request) {
 
     const supa = supabaseAdmin();
 
-    /**
-     * ✅ Webflow v2 eCommerce: endpoint "scopé site"
-     * GET /v2/sites/{site_id}/products/{product_id}
-     */
+    // ✅ Webflow v2 eCommerce: endpoint scoppé par site
     const wf = await webflowJson(`sites/${siteId}/products/${webflowProductId}`, { method: "GET" });
 
     const product = wf?.product;
@@ -89,7 +86,7 @@ export async function POST(req: Request) {
       fieldData: fd,
     };
 
-    // 1) Upsert product + récupérer products.id (bigint)
+    // 1) Upsert product et récupère products.id (bigint)
     const { data: upsertedProduct, error: upsertProdErr } = await supa
       .from("products")
       .upsert(
@@ -124,7 +121,7 @@ export async function POST(req: Request) {
 
     const productDbId = upsertedProduct.id as number;
 
-    // 2) Upsert variants (skus) avec product_id NOT NULL ✅
+    // 2) Upsert variants
     let insertedVariants = 0;
 
     for (const sku of skus) {
@@ -136,8 +133,10 @@ export async function POST(req: Request) {
       const currency = (skuFd.price?.unit || skuFd.price?.currency || "EUR") as string;
       const optionValues = safeJson(skuFd["sku-values"]);
 
-      const variantRow = {
-        product_id: productDbId,
+      // ✅ IMPORTANT: on envoie les 2 champs (selon ton schéma)
+      const variantRow: any = {
+        product_id: productDbId,                 // si ta table a product_id (bigint)
+        webflow_product_id: String(product.id),  // si ta table a webflow_product_id (text NOT NULL)
         webflow_sku_id: String(skuId),
         sku: safeText(skuFd.sku) || null,
         name: safeText(skuFd.name) || null,
