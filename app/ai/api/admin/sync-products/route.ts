@@ -1,6 +1,5 @@
-// app/ai/api/admin/sync-product/route.ts
-import { getProduct, moneyToNumber } from "@/lib/webflow";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
+// app/ai/api/admin/sync-products/route.ts
+import { listProducts } from "@/lib/webflow";
 
 export const runtime = "nodejs";
 
@@ -13,12 +12,6 @@ function assertAdmin(req: Request) {
   return null;
 }
 
-function productUrlFromSlug(slug: string | null | undefined) {
-  const base = (process.env.CAMPROTECT_BASE_URL || "").replace(/\/$/, "");
-  if (!base || !slug) return null;
-  return `${base}/product/${slug}`;
-}
-
 export async function POST(req: Request) {
   const unauth = assertAdmin(req);
   if (unauth) return unauth;
@@ -28,95 +21,55 @@ export async function POST(req: Request) {
     return Response.json({ ok: false, error: "Missing WEBFLOW_SITE_ID" }, { status: 500 });
   }
 
-  const body = await req.json().catch(() => ({}));
-  const webflowProductId = String(body?.webflowProductId || "");
-  if (!webflowProductId) {
-    return Response.json({ ok: false, error: "Missing webflowProductId" }, { status: 400 });
-  }
-
-  const sb = supabaseAdmin();
+  const limit = 250;
+  let offset = 0;
+  const ids: string[] = [];
 
   try {
-    const data = await getProduct(siteId, webflowProductId);
-    const product = data?.product;
-    const skus = Array.isArray(data?.skus) ? data.skus : [];
+    while (true) {
+      const page = await listProducts(siteId, offset, limit);
+      const items = Array.isArray(page?.items) ? page.items : [];
 
-    const slug = product?.fieldData?.slug ?? null;
-    const url = productUrlFromSlug(slug);
+      for (const it of items) {
+        const id = it?.product?.id;
+        if (typeof id === "string" && id) ids.push(id);
+      }
 
-    // ---------- 1) UPSERT PRODUCT ----------
-    const productRow = {
-      webflow_product_id: product?.id ?? webflowProductId,
-      slug: slug,
-      name: product?.fieldData?.name ?? null,
-      brand: product?.fieldData?.fabricants ?? null, // chez toi c’est un ID (ok)
-      product_reference: product?.fieldData?.product_reference ?? product?.fieldData?.["product-reference"] ?? null,
-      url,
-
-      description: product?.fieldData?.description ?? null,
-      meta_description: product?.fieldData?.["meta-description"] ?? product?.fieldData?.meta_description ?? null,
-      bullet_point: product?.fieldData?.["bullet-point"] ?? null,
-      description_complete: product?.fieldData?.["description-complete"] ?? null,
-      texte_supplementaire_fiche_produit: product?.fieldData?.["texte-supplementaire-fiche-produit"] ?? null,
-      fiche_technique_url: product?.fieldData?.["fiche-technique-du-produit"]?.url ?? null,
-      altword: product?.fieldData?.altword ?? null,
-    };
-
-    const upProd = await sb
-      .from("products")
-      .upsert(productRow, { onConflict: "webflow_product_id" })
-      .select("id, webflow_product_id")
-      .single();
-
-    if (upProd.error) {
-      return Response.json(
-        { ok: false, error: "Supabase products upsert failed", details: upProd.error.message },
-        { status: 500 }
-      );
+      if (items.length < limit) break;
+      offset += limit;
     }
 
-    const productId = upProd.data.id;
+    const origin = new URL(req.url).origin;
 
-    // ---------- 2) UPSERT VARIANTS (SKUS) ----------
-    const variantRows = skus.map((s: any) => {
-      const money = s?.fieldData?.price || null;
-      const price = moneyToNumber(money);
+    let okCount = 0;
+    const errors: Array<{ id: string; error: string }> = [];
 
-      return {
-        product_id: productId,
-        webflow_product_id: product?.id ?? webflowProductId,
-        webflow_sku_id: s?.id ?? null,
+    for (const id of ids) {
+      const r = await fetch(`${origin}/ai/api/admin/sync-product`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-admin-token": req.headers.get("x-admin-token") || "",
+        },
+        body: JSON.stringify({ webflowProductId: id }),
+      });
 
-        sku: s?.fieldData?.sku ?? null,
-        name: s?.fieldData?.name ?? null,
-        slug: s?.fieldData?.slug ?? null,
-
-        price,
-        price_raw: typeof money?.value === "number" ? money.value : null,
-        currency: (money?.currency || money?.unit || "EUR") ?? "EUR",
-
-        option_values: s?.fieldData?.["sku-values"] ?? null,
-      };
-    });
-
-    if (variantRows.length > 0) {
-      const upVar = await sb
-        .from("product_variants")
-        .upsert(variantRows, { onConflict: "webflow_sku_id" });
-
-      if (upVar.error) {
-        return Response.json(
-          { ok: false, error: "Supabase variants upsert failed", details: upVar.error.message },
-          { status: 500 }
-        );
-      }
+      const j = await r.json().catch(() => null);
+      if (r.ok && j?.ok) okCount++;
+      else errors.push({ id, error: j?.details || j?.error || `HTTP ${r.status}` });
     }
 
     return Response.json({
       ok: true,
-      synced: { product: productRow.webflow_product_id, variants: variantRows.length },
+      totalFound: ids.length,
+      synced: okCount,
+      failed: errors.length,
+      errors: errors.slice(0, 25),
     });
   } catch (e: any) {
-    return Response.json({ ok: false, error: "Internal error", details: String(e?.message || e) }, { status: 500 });
+    return Response.json(
+      { ok: false, error: "Internal error", details: String(e?.message || e) },
+      { status: 500 }
+    );
   }
 }
