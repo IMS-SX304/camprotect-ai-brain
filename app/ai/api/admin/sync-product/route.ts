@@ -1,6 +1,5 @@
-// app/ai/api/admin/sync-products/route.ts
-
-import { webflowJson, moneyToNumber } from "@/lib/webflow";
+// app/ai/api/admin/sync-product/route.ts
+import { getProduct, moneyToNumber } from "@/lib/webflow";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 export const runtime = "nodejs";
@@ -9,15 +8,12 @@ function assertAdmin(req: Request) {
   const admin = process.env.ADMIN_TOKEN;
   const got = req.headers.get("x-admin-token");
   if (!admin || !got || got !== admin) {
-    return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), {
-      status: 401,
-      headers: { "content-type": "application/json" },
-    });
+    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
   return null;
 }
 
-function productUrlFromSlug(slug?: string | null) {
+function productUrlFromSlug(slug: string | null | undefined) {
   const base = (process.env.CAMPROTECT_BASE_URL || "").replace(/\/$/, "");
   if (!base || !slug) return null;
   return `${base}/product/${slug}`;
@@ -32,100 +28,90 @@ export async function POST(req: Request) {
     return Response.json({ ok: false, error: "Missing WEBFLOW_SITE_ID" }, { status: 500 });
   }
 
+  const body = await req.json().catch(() => ({}));
+  const webflowProductId = String(body?.webflowProductId || "");
+  if (!webflowProductId) {
+    return Response.json({ ok: false, error: "Missing webflowProductId" }, { status: 400 });
+  }
+
   const sb = supabaseAdmin();
 
-  const limit = 250;
-  let offset = 0;
-  let productsUpserted = 0;
-  let variantsUpserted = 0;
-
   try {
-    while (true) {
-      const list = await webflowJson(`/sites/${siteId}/products?offset=${offset}&limit=${limit}`);
-      const items = Array.isArray(list?.items) ? list.items : [];
-      if (items.length === 0) break;
+    const data = await getProduct(siteId, webflowProductId);
+    const product = data?.product;
+    const skus = Array.isArray(data?.skus) ? data.skus : [];
 
-      for (const it of items) {
-        const productId = it?.product?.id;
-        if (!productId) continue;
+    const slug = product?.fieldData?.slug ?? null;
+    const url = productUrlFromSlug(slug);
 
-        const detail = await webflowJson(`/sites/${siteId}/products/${productId}`);
-        const product = detail?.product;
-        const skus = Array.isArray(detail?.skus) ? detail.skus : [];
-        const fd = product?.fieldData || {};
-        const slug = fd?.slug ?? product?.slug ?? null;
+    const productRow = {
+      webflow_product_id: product?.id ?? webflowProductId,
+      slug,
+      name: product?.fieldData?.name ?? null,
+      brand: product?.fieldData?.fabricants ?? null,
+      product_reference:
+        product?.fieldData?.product_reference ??
+        product?.fieldData?.["product-reference"] ??
+        null,
+      url,
 
-        const productRow = {
-          webflow_product_id: product?.id ?? productId,
-          slug,
-          name: fd?.name ?? null,
-          brand: fd?.fabricants ?? fd?.brand ?? null,
-          product_type: fd?.["type-de-produit"] ?? fd?.product_type ?? null,
-          product_reference: fd?.["product-reference"] ?? fd?.product_reference ?? null,
-          altword: fd?.altword ?? null,
-          benefice_court: fd?.["benefice-court"] ?? null,
-          meta_description: fd?.["meta-description"] ?? null,
-          description: fd?.description ?? null,
-          description_complete: fd?.["description-complete"] ?? null,
-          fiche_technique_url: fd?.["fiche-technique-du-produit"]?.url ?? null,
-          url: productUrlFromSlug(slug),
-          last_published: product?.lastPublished ?? null,
-          last_updated: product?.lastUpdated ?? null,
-        };
+      description: product?.fieldData?.description ?? null,
+      meta_description: product?.fieldData?.["meta-description"] ?? null,
+      bullet_point: product?.fieldData?.["bullet-point"] ?? null,
+      description_complete: product?.fieldData?.["description-complete"] ?? null,
+      texte_supplementaire_fiche_produit:
+        product?.fieldData?.["texte-supplementaire-fiche-produit"] ?? null,
+      fiche_technique_url: product?.fieldData?.["fiche-technique-du-produit"]?.url ?? null,
+      altword: product?.fieldData?.altword ?? null,
+    };
 
-        const upProd = await sb.from("products").upsert(productRow, {
-          onConflict: "webflow_product_id",
-        });
+    const upProd = await sb
+      .from("products")
+      .upsert(productRow, { onConflict: "webflow_product_id" })
+      .select("id")
+      .single();
 
-        if (upProd.error) {
-          return Response.json(
-            { ok: false, error: "Supabase products upsert failed", details: upProd.error.message },
-            { status: 500 }
-          );
-        }
-        productsUpserted += 1;
-
-        for (const s of skus) {
-          const sfd = s?.fieldData || {};
-          const skuId = s?.id ?? null;
-          if (!skuId) continue;
-
-          const vRow = {
-            webflow_product_id: product?.id ?? productId,
-            webflow_sku_id: skuId,
-            sku: sfd?.sku ?? null,
-            name: sfd?.name ?? null,
-            slug: sfd?.slug ?? null,
-            url: productUrlFromSlug(slug), // URL page produit
-            price: moneyToNumber(sfd?.price) ?? null,
-            currency: (sfd?.price?.unit || sfd?.price?.currency || null) as string | null,
-            option_values: sfd?.["sku-values"] ?? null,
-            main_image_url: sfd?.["main-image"]?.url ?? null,
-            updated_at: new Date().toISOString(),
-          };
-
-          const upVar = await sb.from("product_variants").upsert(vRow, {
-            onConflict: "webflow_sku_id",
-          });
-
-          if (upVar.error) {
-            return Response.json(
-              { ok: false, error: "Supabase variants upsert failed", details: upVar.error.message },
-              { status: 500 }
-            );
-          }
-          variantsUpserted += 1;
-        }
-      }
-
-      offset += limit;
+    if (upProd.error) {
+      return Response.json(
+        { ok: false, error: "Supabase products upsert failed", details: upProd.error.message },
+        { status: 500 }
+      );
     }
 
-    return Response.json({
-      ok: true,
-      productsUpserted,
-      variantsUpserted,
+    const productId = upProd.data.id;
+
+    const variantRows = skus.map((s: any) => {
+      const money = s?.fieldData?.price || null;
+      const price = moneyToNumber(money);
+
+      return {
+        product_id: productId,
+        webflow_product_id: product?.id ?? webflowProductId,
+        webflow_sku_id: s?.id ?? null,
+        sku: s?.fieldData?.sku ?? null,
+        name: s?.fieldData?.name ?? null,
+        slug: s?.fieldData?.slug ?? null,
+        price,
+        price_raw: typeof money?.value === "number" ? money.value : null,
+        currency: (money?.currency || money?.unit || "EUR") ?? "EUR",
+        option_values: s?.fieldData?.["sku-values"] ?? null,
+      };
     });
+
+    if (variantRows.length) {
+      const upVar = await sb
+        .from("product_variants")
+        .upsert(variantRows, { onConflict: "webflow_sku_id" });
+
+      if (upVar.error) {
+        return Response.json(
+          { ok: false, error: "Supabase variants upsert failed", details: upVar.error.message },
+          { status: 500 }
+        );
+      }
+    }
+
+    return Response.json({ ok: true, synced: { productId: webflowProductId, variants: variantRows.length } });
   } catch (e: any) {
     return Response.json(
       { ok: false, error: "Internal error", details: String(e?.message || e) },
