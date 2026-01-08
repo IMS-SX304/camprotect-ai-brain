@@ -1,6 +1,6 @@
 // app/ai/api/admin/sync-products/route.ts
-
 import { webflowJson } from "@/lib/webflow";
+import { syncWebflowProduct } from "@/lib/syncWebflowProduct";
 
 export const runtime = "nodejs";
 
@@ -16,6 +16,10 @@ function assertAdmin(req: Request) {
   return null;
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 export async function POST(req: Request) {
   const unauth = assertAdmin(req);
   if (unauth) return unauth;
@@ -25,7 +29,6 @@ export async function POST(req: Request) {
     return Response.json({ ok: false, error: "Missing WEBFLOW_SITE_ID" }, { status: 500 });
   }
 
-  // Webflow renvoie souvent max 100 items/page
   const limit = 100;
   let offset = 0;
 
@@ -35,60 +38,31 @@ export async function POST(req: Request) {
   let totalFound = 0;
 
   while (true) {
-    let page: any;
-    try {
-      page = await webflowJson(`/sites/${siteId}/products?offset=${offset}&limit=${limit}`, { method: "GET" });
-    } catch (e: any) {
-      return Response.json({ ok: false, error: "Webflow list failed", details: String(e?.message || e) }, { status: 500 });
-    }
-
+    const page = await webflowJson(`/sites/${siteId}/products?offset=${offset}&limit=${limit}`, { method: "GET" });
     const items = page?.items || [];
-    if (offset === 0) {
-      // Certains endpoints donnent total ailleurs, sinon on approx
-      totalFound = page?.pagination?.total ?? items.length;
-    }
 
+    if (offset === 0) totalFound = page?.pagination?.total ?? items.length;
     if (!items.length) break;
 
     for (const it of items) {
-      const webflowProductId = it?.product?.id || it?.id;
-      if (!webflowProductId) continue;
+      const id = it?.product?.id || it?.id;
+      if (!id) continue;
 
       try {
-        // On appelle le sync-product interne (même host)
-        const r = await fetch(new URL("/ai/api/admin/sync-product", req.url), {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-admin-token": req.headers.get("x-admin-token") || "",
-          },
-          body: JSON.stringify({ webflowProductId }),
-        });
-
-        const j = await r.json().catch(() => null);
-        if (!r.ok || !j?.ok) {
-          failed++;
-          errors.push({ webflowProductId, status: r.status, error: j?.error, details: j?.details });
-        } else {
-          synced++;
-        }
+        await syncWebflowProduct(id);
+        synced++;
       } catch (e: any) {
         failed++;
-        errors.push({ webflowProductId, error: "sync-product fetch failed", details: String(e?.message || e) });
+        errors.push({ id, error: "SYNC_FAILED", details: String(e?.message || e) });
       }
+
+      // Petite pause pour éviter rate-limit (safe)
+      await sleep(120);
     }
 
     offset += limit;
-
-    // Stop si on a atteint la fin (quand moins que limit)
     if (items.length < limit) break;
   }
 
-  return Response.json({
-    ok: true,
-    totalFound,
-    synced,
-    failed,
-    errors,
-  });
+  return Response.json({ ok: true, totalFound, synced, failed, errors });
 }
