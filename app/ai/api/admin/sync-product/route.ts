@@ -1,5 +1,6 @@
 // app/ai/api/admin/sync-product/route.ts
-import { getProduct, moneyToNumber } from "@/lib/webflow";
+
+import { webflowJson, moneyToNumber } from "@/lib/webflow";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 export const runtime = "nodejs";
@@ -8,13 +9,16 @@ function assertAdmin(req: Request) {
   const admin = process.env.ADMIN_TOKEN;
   const got = req.headers.get("x-admin-token");
   if (!admin || !got || got !== admin) {
-    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
   }
   return null;
 }
 
-function productUrlFromSlug(slug: string | null | undefined) {
-  const base = (process.env.CAMPROTECT_BASE_URL || "").replace(/\/$/, "");
+function productUrlFromSlug(slug?: string | null) {
+  const base = (process.env.CAMPROTECT_BASE_URL || "").replace(/\/+$/, "");
   if (!base || !slug) return null;
   return `${base}/product/${slug}`;
 }
@@ -29,7 +33,8 @@ export async function POST(req: Request) {
   }
 
   const body = await req.json().catch(() => ({}));
-  const webflowProductId = String(body?.webflowProductId || "");
+  const webflowProductId = body?.webflowProductId as string | undefined;
+
   if (!webflowProductId) {
     return Response.json({ ok: false, error: "Missing webflowProductId" }, { status: 400 });
   }
@@ -37,38 +42,40 @@ export async function POST(req: Request) {
   const sb = supabaseAdmin();
 
   try {
-    const data = await getProduct(siteId, webflowProductId);
+    // 1) Récupérer produit + SKUs (IMPORTANT pour variantes)
+    const data = await webflowJson(`/sites/${siteId}/products/${webflowProductId}`, { method: "GET" });
+
     const product = data?.product;
-    const skus = Array.isArray(data?.skus) ? data.skus : [];
+    const skus = data?.skus || [];
 
-    const slug = product?.fieldData?.slug ?? null;
-    const url = productUrlFromSlug(slug);
+    if (!product?.id) {
+      return Response.json({ ok: false, error: "Product not found in Webflow response" }, { status: 404 });
+    }
 
-    const productRow = {
-      webflow_product_id: product?.id ?? webflowProductId,
+    const fd = product.fieldData || {};
+    const slug = fd.slug ?? null;
+
+    // 2) Upsert product
+    const productRow: any = {
+      webflow_product_id: product.id,
       slug,
-      name: product?.fieldData?.name ?? null,
-      brand: product?.fieldData?.fabricants ?? null,
-      product_reference:
-        product?.fieldData?.product_reference ??
-        product?.fieldData?.["product-reference"] ??
-        null,
-      url,
-
-      description: product?.fieldData?.description ?? null,
-      meta_description: product?.fieldData?.["meta-description"] ?? null,
-      bullet_point: product?.fieldData?.["bullet-point"] ?? null,
-      description_complete: product?.fieldData?.["description-complete"] ?? null,
-      texte_supplementaire_fiche_produit:
-        product?.fieldData?.["texte-supplementaire-fiche-produit"] ?? null,
-      fiche_technique_url: product?.fieldData?.["fiche-technique-du-produit"]?.url ?? null,
-      altword: product?.fieldData?.altword ?? null,
+      name: fd.name ?? null,
+      brand: fd.fabricants ?? fd.brand ?? null, // chez toi c’est un ID de collection
+      product_reference: fd["product-reference"] ?? fd.productReference ?? null,
+      url: productUrlFromSlug(slug),
+      altword: fd.altword ?? null,
+      benefice_court: fd["benefice-court"] ?? null,
+      meta_description: fd["meta-description"] ?? null,
+      description: fd.description ?? null,
+      description_complete: fd["description-complete"] ?? null,
+      bullet_point: fd["bullet-point"] ?? null,
+      raw_field_data: fd,
     };
 
     const upProd = await sb
       .from("products")
       .upsert(productRow, { onConflict: "webflow_product_id" })
-      .select("id")
+      .select("id, webflow_product_id")
       .single();
 
     if (upProd.error) {
@@ -78,23 +85,25 @@ export async function POST(req: Request) {
       );
     }
 
-    const productId = upProd.data.id;
+    const dbProductId = upProd.data.id;
 
+    // 3) Upsert variants (skus)
     const variantRows = skus.map((s: any) => {
-      const money = s?.fieldData?.price || null;
-      const price = moneyToNumber(money);
+      const sfd = s.fieldData || {};
+      const priceNum = moneyToNumber(sfd.price);
 
       return {
-        product_id: productId,
-        webflow_product_id: product?.id ?? webflowProductId,
-        webflow_sku_id: s?.id ?? null,
-        sku: s?.fieldData?.sku ?? null,
-        name: s?.fieldData?.name ?? null,
-        slug: s?.fieldData?.slug ?? null,
-        price,
-        price_raw: typeof money?.value === "number" ? money.value : null,
-        currency: (money?.currency || money?.unit || "EUR") ?? "EUR",
-        option_values: s?.fieldData?.["sku-values"] ?? null,
+        product_id: dbProductId,
+        webflow_product_id: product.id,
+        webflow_sku_id: s.id,
+        sku: sfd.sku ?? null,
+        name: sfd.name ?? null,
+        slug: sfd.slug ?? null,
+        price: priceNum,
+        currency: (sfd.price?.currency || sfd.price?.unit || "EUR") ?? "EUR",
+        option_values: sfd["sku-values"] ?? null,
+        main_image_url: sfd["main-image"]?.url ?? null,
+        raw_field_data: sfd,
       };
     });
 
@@ -111,11 +120,14 @@ export async function POST(req: Request) {
       }
     }
 
-    return Response.json({ ok: true, synced: { productId: webflowProductId, variants: variantRows.length } });
+    return Response.json({
+      ok: true,
+      webflowProductId: product.id,
+      productDbId: dbProductId,
+      variants: variantRows.length,
+      url: productRow.url,
+    });
   } catch (e: any) {
-    return Response.json(
-      { ok: false, error: "Internal error", details: String(e?.message || e) },
-      { status: 500 }
-    );
+    return Response.json({ ok: false, error: "Internal error", details: String(e?.message || e) }, { status: 500 });
   }
 }
