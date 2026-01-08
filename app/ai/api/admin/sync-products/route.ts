@@ -1,5 +1,6 @@
 // app/ai/api/admin/sync-products/route.ts
-import { listProducts } from "@/lib/webflow";
+
+import { webflowJson } from "@/lib/webflow";
 
 export const runtime = "nodejs";
 
@@ -7,7 +8,10 @@ function assertAdmin(req: Request) {
   const admin = process.env.ADMIN_TOKEN;
   const got = req.headers.get("x-admin-token");
   if (!admin || !got || got !== admin) {
-    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
   }
   return null;
 }
@@ -21,55 +25,70 @@ export async function POST(req: Request) {
     return Response.json({ ok: false, error: "Missing WEBFLOW_SITE_ID" }, { status: 500 });
   }
 
-  const limit = 250;
+  // Webflow renvoie souvent max 100 items/page
+  const limit = 100;
   let offset = 0;
-  const ids: string[] = [];
 
-  try {
-    while (true) {
-      const page = await listProducts(siteId, offset, limit);
-      const items = Array.isArray(page?.items) ? page.items : [];
+  const errors: any[] = [];
+  let synced = 0;
+  let failed = 0;
+  let totalFound = 0;
 
-      for (const it of items) {
-        const id = it?.product?.id;
-        if (typeof id === "string" && id) ids.push(id);
+  while (true) {
+    let page: any;
+    try {
+      page = await webflowJson(`/sites/${siteId}/products?offset=${offset}&limit=${limit}`, { method: "GET" });
+    } catch (e: any) {
+      return Response.json({ ok: false, error: "Webflow list failed", details: String(e?.message || e) }, { status: 500 });
+    }
+
+    const items = page?.items || [];
+    if (offset === 0) {
+      // Certains endpoints donnent total ailleurs, sinon on approx
+      totalFound = page?.pagination?.total ?? items.length;
+    }
+
+    if (!items.length) break;
+
+    for (const it of items) {
+      const webflowProductId = it?.product?.id || it?.id;
+      if (!webflowProductId) continue;
+
+      try {
+        // On appelle le sync-product interne (même host)
+        const r = await fetch(new URL("/ai/api/admin/sync-product", req.url), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-admin-token": req.headers.get("x-admin-token") || "",
+          },
+          body: JSON.stringify({ webflowProductId }),
+        });
+
+        const j = await r.json().catch(() => null);
+        if (!r.ok || !j?.ok) {
+          failed++;
+          errors.push({ webflowProductId, status: r.status, error: j?.error, details: j?.details });
+        } else {
+          synced++;
+        }
+      } catch (e: any) {
+        failed++;
+        errors.push({ webflowProductId, error: "sync-product fetch failed", details: String(e?.message || e) });
       }
-
-      if (items.length < limit) break;
-      offset += limit;
     }
 
-    const origin = new URL(req.url).origin;
+    offset += limit;
 
-    let okCount = 0;
-    const errors: Array<{ id: string; error: string }> = [];
-
-    for (const id of ids) {
-      const r = await fetch(`${origin}/ai/api/admin/sync-product`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-admin-token": req.headers.get("x-admin-token") || "",
-        },
-        body: JSON.stringify({ webflowProductId: id }),
-      });
-
-      const j = await r.json().catch(() => null);
-      if (r.ok && j?.ok) okCount++;
-      else errors.push({ id, error: j?.details || j?.error || `HTTP ${r.status}` });
-    }
-
-    return Response.json({
-      ok: true,
-      totalFound: ids.length,
-      synced: okCount,
-      failed: errors.length,
-      errors: errors.slice(0, 25),
-    });
-  } catch (e: any) {
-    return Response.json(
-      { ok: false, error: "Internal error", details: String(e?.message || e) },
-      { status: 500 }
-    );
+    // Stop si on a atteint la fin (quand moins que limit)
+    if (items.length < limit) break;
   }
+
+  return Response.json({
+    ok: true,
+    totalFound,
+    synced,
+    failed,
+    errors,
+  });
 }
