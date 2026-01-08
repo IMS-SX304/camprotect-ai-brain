@@ -15,23 +15,30 @@ function assertAdmin(req: Request) {
   return null;
 }
 
+/**
+ * POST /ai/api/admin/sync-product
+ * Body:
+ * { "webflowProductId": "..." }
+ */
 export async function POST(req: Request) {
   const unauth = assertAdmin(req);
   if (unauth) return unauth;
 
-  const body = await req.json().catch(() => ({}));
-  const webflowProductId = body?.webflowProductId as string | undefined;
-
-  if (!webflowProductId) {
-    return Response.json({ ok: false, error: "Missing webflowProductId" }, { status: 400 });
-  }
-
   try {
+    const body = await req.json().catch(() => ({}));
+    const webflowProductId = String(body?.webflowProductId || "").trim();
+
+    if (!webflowProductId) {
+      return Response.json({ ok: false, error: "Missing webflowProductId" }, { status: 400 });
+    }
+
     const result = await syncWebflowProduct(webflowProductId);
-    return Response.json({ ok: true, ...result });
+
+    // ✅ Une seule fois "ok"
+    return Response.json({ ok: true, result });
   } catch (e: any) {
     return Response.json(
-      { ok: false, error: "sync-product failed", details: String(e?.message || e) },
+      { ok: false, error: "Internal error", details: String(e?.message || e) },
       { status: 500 }
     );
   }
