@@ -3,6 +3,7 @@ import { webflowJson } from "@/lib/webflow";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 type WebflowPrice = { value: number; unit?: string };
+
 type WebflowSku = {
   id: string;
   fieldData?: {
@@ -10,8 +11,8 @@ type WebflowSku = {
     name?: string;
     slug?: string;
     price?: WebflowPrice | null;
-    compare-at-price?: WebflowPrice | null;
-    sku-values?: Record<string, string>; // optionId -> enumId
+    "compare-at-price"?: WebflowPrice | null;
+    "sku-values"?: Record<string, string>; // optionId -> enumId
   };
 };
 
@@ -36,17 +37,16 @@ type WebflowProduct = {
       name: string;
       enum: Array<{ id: string; name: string; slug: string }>;
     }>;
+    "default-sku"?: string;
   };
 };
 
 function toMoney(price?: WebflowPrice | null): number | null {
   if (!price || typeof price.value !== "number") return null;
 
-  // Webflow renvoie souvent les cents: 24354 => 243.54
-  // Mais parfois ça peut déjà être un "vrai" montant selon les configs.
-  // On applique une règle robuste :
-  // - si value >= 1000 => on suppose cents
-  // - sinon => on suppose montant normal
+  // Règle robuste:
+  // - si value >= 1000 => on suppose cents (24354 => 243.54)
+  // - sinon => on suppose déjà en unité
   const v = price.value;
   if (v >= 1000) return Math.round(v) / 100;
   return v;
@@ -76,11 +76,15 @@ export async function syncWebflowProduct(webflowProductId: string) {
 
   // SKU "principal" (utile pour recherche par ref) :
   // on prend le sku de la variante "default" si possible, sinon le 1er sku.
-  const defaultSkuId = (pfd as any)["default-sku"] as string | undefined;
+  const defaultSkuId = pfd["default-sku"];
   const defaultSku = skus.find((s) => s.id === defaultSkuId) || skus[0];
-  const skuCode = (defaultSku?.fieldData?.sku || pfd["product-reference"] || pfd["code-fabricant"] || "").trim() || null;
+  const skuCode =
+    (defaultSku?.fieldData?.sku ||
+      pfd["product-reference"] ||
+      pfd["code-fabricant"] ||
+      "").trim() || null;
 
-  // On calcule un prix "à partir de" = min des variantes
+  // Prix "à partir de" = min des variantes
   const prices = skus
     .map((s) => toMoney(s.fieldData?.price ?? null))
     .filter((x): x is number => typeof x === "number");
@@ -89,25 +93,25 @@ export async function syncWebflowProduct(webflowProductId: string) {
   const supa = supabaseAdmin();
 
   // 2) UPSERT product
-  const productRow = {
+  const productRow: any = {
     webflow_product_id: product.id,
     slug: slug || null,
     url: url,
     title: (pfd.name || "").trim() || null,
     description: (pfd.description || "").trim() || null,
 
-    // Champs utiles e-commerce / search
-    sku: skuCode, // si ta table products a une colonne sku (sinon supprime cette ligne)
-    price: minPrice, // idem, si ta table products a une colonne price (sinon supprime cette ligne)
+    // ⚠️ Ces colonnes doivent exister (tu m’as dit que oui)
+    sku: skuCode,
+    price: minPrice,
     currency: "EUR",
 
-    // Champs CMS pour l'IA
+    // Champs CMS utiles IA
     altword: (pfd.altword || "").trim() || null,
     benefice_court: (pfd["benefice-court"] || "").trim() || null,
     meta_description: (pfd["meta-description"] || "").trim() || null,
     fiche_technique_url: (pfd["fiche-technique-du-produit"] as any)?.url || null,
 
-    // Gros contenu (si tu as une colonne jsonb payload, c’est le top)
+    // Payload complet (jsonb)
     payload: {
       ...pfd,
       camprotect_url: url,
@@ -123,6 +127,7 @@ export async function syncWebflowProduct(webflowProductId: string) {
   if (upProdErr) {
     throw new Error(`Supabase products upsert failed: ${upProdErr.message}`);
   }
+
   const productId = upProd?.id;
   if (!productId) throw new Error("Supabase products upsert did not return id");
 
@@ -132,14 +137,16 @@ export async function syncWebflowProduct(webflowProductId: string) {
     return {
       webflow_sku_id: s.id,
       webflow_product_id: product.id,
-      product_id: productId, // ⚠️ évite ton erreur NOT NULL
+      product_id: productId, // évite NOT NULL
       sku: (sfd.sku || "").trim() || null,
       title: (sfd.name || "").trim() || null,
       slug: (sfd.slug || "").trim() || null,
       price: toMoney(sfd.price ?? null),
-      currency: "EUR",
-      option_values: sfd["sku-values"] || null, // jsonb recommandé en base
-      payload: sfd, // jsonb
+      currency: (sfd.price?.unit || "EUR").toString(),
+
+      // jsonb recommandé
+      option_values: sfd["sku-values"] || null,
+      payload: sfd,
     };
   });
 
