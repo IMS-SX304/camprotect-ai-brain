@@ -39,8 +39,6 @@ function productRowToChunk(p: any) {
   if (typeof p?.price === "number") lines.push(`Prix: ${p.price} ${p.currency || "EUR"}`);
   if (url) lines.push(`URL: ${url}`);
 
-  // payload brut (jsonb) = ton or IA
-  // on récupère quelques champs fréquents s'ils existent
   const payload = p?.payload || {};
   const desc =
     payload?.description_complete ||
@@ -60,7 +58,6 @@ function productRowToChunk(p: any) {
   if (altword) lines.push(`Altwords: ${String(altword)}`);
   if (fiche) lines.push(`Fiche technique: ${String(fiche)}`);
 
-  // fallback: si c'est vide, on garde au moins payload stringify
   if (lines.length <= 1 && payload && Object.keys(payload).length) {
     lines.push(`Données: ${JSON.stringify(payload)}`);
   }
@@ -81,11 +78,12 @@ export async function POST(req: Request) {
 
   const supa = supabaseAdmin();
 
-  // 1) On lit des produits depuis la table products (déjà sync Webflow)
-  // NB: on lit limit, puis on en traite batchSize pour éviter timeout
+  // ✅ IMPORTANT: on inclut webflow_product_id pour éviter l'erreur TS
   const { data: products, error: readErr } = await supa
     .from("products")
-    .select("id, name, brand, product_type, product_reference, sku, url, price, currency, description, altword, benefice_court, meta_description, fiche_technique_url, payload")
+    .select(
+      "id, webflow_product_id, name, brand, product_type, product_reference, sku, url, price, currency, description, altword, benefice_court, meta_description, fiche_technique_url, payload"
+    )
     .order("id", { ascending: true })
     .range(offset, offset + limit - 1);
 
@@ -130,7 +128,6 @@ export async function POST(req: Request) {
         url: p?.url ?? null,
       };
 
-      // 2) UPSERT dans product_chunks (colonnes: product_id, chunk, meta, embedding)
       const { error: upErr } = await supa
         .from("product_chunks")
         .upsert(
@@ -140,7 +137,7 @@ export async function POST(req: Request) {
             meta,
             embedding: vector,
           },
-          { onConflict: "product_id,chunk" } // nécessite l'index unique
+          { onConflict: "product_id,chunk" }
         );
 
       if (upErr) throw new Error(`chunk upsert failed: ${upErr.message}`);
