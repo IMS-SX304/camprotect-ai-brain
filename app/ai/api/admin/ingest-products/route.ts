@@ -4,14 +4,12 @@ import { openaiJson } from "@/lib/openai";
 
 export const runtime = "nodejs";
 
-function assertAdmin(req: Request) {
+function requireAdmin(req: Request) {
+  const token = req.headers.get("x-admin-token");
   const expected = process.env.ADMIN_TOKEN;
-  const got = req.headers.get("x-admin-token");
-  if (!expected || !got || got !== expected) {
-    return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), {
-      status: 401,
-      headers: { "content-type": "application/json" },
-    });
+  if (!expected) throw new Error("Missing env ADMIN_TOKEN");
+  if (!token || token !== expected) {
+    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
   return null;
 }
@@ -26,228 +24,150 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function chunkText(text: string, maxChars = 2200) {
-  const clean = (text || "").trim();
-  if (!clean) return [];
-  if (clean.length <= maxChars) return [clean];
-
-  const out: string[] = [];
-  let buf = "";
-  const parts = clean.split(/\n+/);
-
-  for (const p of parts) {
-    const line = p.trim();
-    if (!line) continue;
-
-    if ((buf + "\n" + line).length > maxChars) {
-      if (buf.trim()) out.push(buf.trim());
-      buf = line;
-    } else {
-      buf = buf ? `${buf}\n${line}` : line;
-    }
-  }
-  if (buf.trim()) out.push(buf.trim());
-  return out;
-}
-
-async function sha1Hex(input: string) {
-  const data = new TextEncoder().encode(input);
-  const hash = await crypto.subtle.digest("SHA-1", data);
-  return Array.from(new Uint8Array(hash))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-function productToRagText(p: any, variants: any[]) {
+// construit un texte "RAG-friendly" à partir de la row products
+function productRowToChunk(p: any) {
   const lines: string[] = [];
 
-  if (p?.name) lines.push(`Nom: ${p.name}`);
-  if (p?.product_reference) lines.push(`Référence produit: ${p.product_reference}`);
+  const name = (p?.name || "").toString().trim();
+  const ref = (p?.product_reference || p?.sku || "").toString().trim();
+  const url = (p?.url || "").toString().trim();
+
+  if (name) lines.push(`Nom: ${name}`);
+  if (ref) lines.push(`Référence: ${ref}`);
   if (p?.brand) lines.push(`Marque: ${p.brand}`);
-  if (p?.url) lines.push(`URL: ${p.url}`);
-  if (p?.price != null) lines.push(`Prix (à partir de): ${p.price} ${p?.currency || "EUR"}`);
+  if (p?.product_type) lines.push(`Type: ${p.product_type}`);
+  if (typeof p?.price === "number") lines.push(`Prix: ${p.price} ${p.currency || "EUR"}`);
+  if (url) lines.push(`URL: ${url}`);
 
-  if (p?.benefice_court) lines.push(`Bénéfice: ${p.benefice_court}`);
-  if (p?.meta_description) lines.push(`Meta: ${p.meta_description}`);
-  if (p?.description) lines.push(`Description: ${p.description}`);
-  if (p?.altword) lines.push(`Mots-clés: ${p.altword}`);
-  if (p?.fiche_technique_url) lines.push(`Fiche technique: ${p.fiche_technique_url}`);
+  // payload brut (jsonb) = ton or IA
+  // on récupère quelques champs fréquents s'ils existent
+  const payload = p?.payload || {};
+  const desc =
+    payload?.description_complete ||
+    payload?.["description-complete"] ||
+    payload?.description ||
+    p?.description ||
+    "";
 
-  if (Array.isArray(variants) && variants.length) {
-    lines.push(`Variantes:`);
-    for (const v of variants) {
-      const vLine: string[] = [];
-      if (v?.sku) vLine.push(`SKU ${v.sku}`);
-      if (v?.name) vLine.push(`${v.name}`);
-      if (v?.price != null) vLine.push(`= ${v.price} ${v?.currency || "EUR"}`);
-      if (vLine.length) lines.push(`- ${vLine.join(" ")}`);
-    }
+  const altword = payload?.altword || p?.altword || "";
+  const benef = payload?.["benefice-court"] || p?.benefice_court || "";
+  const meta = payload?.["meta-description"] || p?.meta_description || "";
+  const fiche = payload?.["fiche-technique-du-produit"]?.url || p?.fiche_technique_url || "";
+
+  if (desc) lines.push(`Description: ${String(desc)}`);
+  if (benef) lines.push(`Bénéfice: ${String(benef)}`);
+  if (meta) lines.push(`Meta: ${String(meta)}`);
+  if (altword) lines.push(`Altwords: ${String(altword)}`);
+  if (fiche) lines.push(`Fiche technique: ${String(fiche)}`);
+
+  // fallback: si c'est vide, on garde au moins payload stringify
+  if (lines.length <= 1 && payload && Object.keys(payload).length) {
+    lines.push(`Données: ${JSON.stringify(payload)}`);
   }
 
-  return lines.join("\n").trim();
+  return lines.join("\n");
 }
 
-async function ingestOneProduct(sb: any, p: any, embedModel: string, dim: number) {
-  const { data: vars, error: varErr } = await sb
-    .from("product_variants")
-    .select("sku, name, price, currency")
-    .eq("product_id", p.id);
-
-  if (varErr) throw new Error(`variants read failed: ${varErr.message}`);
-
-  const ragText = productToRagText(p, vars || []);
-  const chunks = chunkText(ragText, 2200);
-  if (!chunks.length) throw new Error("EMPTY_TEXT");
-
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    const chunk_hash = await sha1Hex(`${p.id}:${i}:${chunk}`);
-
-    const emb = await openaiJson("embeddings", { model: embedModel, input: chunk });
-    const vector = emb?.data?.[0]?.embedding;
-
-    if (!Array.isArray(vector) || vector.length !== dim) {
-      throw new Error(`embedding bad dim: got=${vector?.length ?? null} expected=${dim}`);
-    }
-
-    const row = {
-      product_id: p.id,
-      chunk,
-      chunk_hash,
-      meta: {
-        webflow_product_id: p.webflow_product_id || null,
-        slug: p.slug || null,
-        url: p.url || null,
-        product_reference: p.product_reference || null,
-        name: p.name || null,
-        brand: p.brand || null,
-        chunk_index: i,
-      },
-      embedding: vector,
-    };
-
-    const { error: upErr } = await sb
-      .from("product_chunks")
-      .upsert(row, { onConflict: "product_id,chunk_hash" });
-
-    if (upErr) throw new Error(`chunk upsert failed: ${upErr.message}`);
-  }
-}
-
-/**
- * POST /ai/api/admin/ingest-products
- *
- * Mode A (batch auto):
- * { offset, limit, batchSize, delayMs }
- *
- * Mode B (ciblé):
- * { products: [260,261] }  // ids de products (bigint)
- */
 export async function POST(req: Request) {
-  const unauth = assertAdmin(req);
-  if (unauth) return unauth;
+  const authFail = requireAdmin(req);
+  if (authFail) return authFail;
 
   const body = await req.json().catch(() => ({}));
 
-  const sb = supabaseAdmin();
+  const offset = clampInt(body?.offset, 0, 0, 1_000_000);
+  const limit = clampInt(body?.limit, 50, 1, 250);
+  const batchSize = clampInt(body?.batchSize, 10, 1, 50);
+  const delayMs = clampInt(body?.delayMs, 120, 0, 5000);
+
+  const supa = supabaseAdmin();
+
+  // 1) On lit des produits depuis la table products (déjà sync Webflow)
+  // NB: on lit limit, puis on en traite batchSize pour éviter timeout
+  const { data: products, error: readErr } = await supa
+    .from("products")
+    .select("id, name, brand, product_type, product_reference, sku, url, price, currency, description, altword, benefice_court, meta_description, fiche_technique_url, payload")
+    .order("id", { ascending: true })
+    .range(offset, offset + limit - 1);
+
+  if (readErr) {
+    return Response.json({ ok: false, error: "Supabase read products failed", details: readErr.message }, { status: 500 });
+  }
+
+  const totalFound = products?.length ?? 0;
+  const slice = (products || []).slice(0, batchSize);
 
   const embedModel = process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small";
   const dim = Number(process.env.EMBED_DIM || 1536);
 
-  // ===== MODE B : ingest ciblé via products[] =====
-  const productsList = body?.products;
-  if (Array.isArray(productsList) && productsList.length > 0) {
-    const ids = productsList.map((x: any) => Number(x)).filter((n: number) => Number.isFinite(n));
-
-    if (!ids.length) {
-      return Response.json({ ok: false, error: "Invalid products[] ids" }, { status: 400 });
-    }
-
-    const { data: products, error: prodErr } = await sb
-      .from("products")
-      .select("id, webflow_product_id, slug, url, name, brand, product_reference, price, currency, description, altword, benefice_court, meta_description, fiche_technique_url")
-      .in("id", ids);
-
-    if (prodErr) {
-      return Response.json({ ok: false, error: "Supabase products read failed", details: prodErr.message }, { status: 500 });
-    }
-
-    const errors: any[] = [];
-    let ingested = 0;
-    let failed = 0;
-
-    for (const p of products || []) {
-      try {
-        await ingestOneProduct(sb, p, embedModel, dim);
-        ingested++;
-      } catch (e: any) {
-        failed++;
-        errors.push({ productId: p?.id, error: "INGEST_FAILED", details: String(e?.message || e) });
-      }
-    }
-
-    return Response.json({ ok: true, mode: "products[]", ingested, failed, errors });
+  if (!Number.isFinite(dim)) {
+    return Response.json({ ok: false, error: "Invalid EMBED_DIM" }, { status: 500 });
   }
 
-  // ===== MODE A : batch auto via offset/limit/batchSize =====
-  const offset = clampInt(body?.offset, 0, 0, 1_000_000);
-  const limit = clampInt(body?.limit, 50, 1, 250);
-  const batchSize = clampInt(body?.batchSize, 5, 1, 50);
-  const delayMs = clampInt(body?.delayMs, 120, 0, 2000);
-
-  const { count: totalFound, error: countErr } = await sb
-    .from("products")
-    .select("id", { count: "exact", head: true });
-
-  if (countErr) {
-    return Response.json({ ok: false, error: "Supabase count failed", details: countErr.message }, { status: 500 });
-  }
-
-  const { data: products, error: prodErr } = await sb
-    .from("products")
-    .select("id, webflow_product_id, slug, url, name, brand, product_reference, price, currency, description, altword, benefice_court, meta_description, fiche_technique_url")
-    .order("id", { ascending: true })
-    .range(offset, offset + limit - 1);
-
-  if (prodErr) {
-    return Response.json({ ok: false, error: "Supabase products read failed", details: prodErr.message }, { status: 500 });
-  }
-
-  const slice = (products || []).slice(0, batchSize);
-
-  const errors: any[] = [];
   let ingested = 0;
   let failed = 0;
+  const errors: any[] = [];
 
   for (const p of slice) {
+    const chunk = productRowToChunk(p);
+
     try {
-      await ingestOneProduct(sb, p, embedModel, dim);
+      const emb = await openaiJson("embeddings", {
+        model: embedModel,
+        input: chunk,
+      });
+
+      const vector = emb?.data?.[0]?.embedding;
+      if (!Array.isArray(vector) || vector.length !== dim) {
+        throw new Error(`Embedding wrong dim (got ${vector?.length ?? "null"} expected ${dim})`);
+      }
+
+      const meta = {
+        type: "product",
+        webflow_product_id: p?.webflow_product_id ?? null,
+        sku: p?.sku ?? null,
+        product_reference: p?.product_reference ?? null,
+        brand: p?.brand ?? null,
+        url: p?.url ?? null,
+      };
+
+      // 2) UPSERT dans product_chunks (colonnes: product_id, chunk, meta, embedding)
+      const { error: upErr } = await supa
+        .from("product_chunks")
+        .upsert(
+          {
+            product_id: p.id,
+            chunk,
+            meta,
+            embedding: vector,
+          },
+          { onConflict: "product_id,chunk" } // nécessite l'index unique
+        );
+
+      if (upErr) throw new Error(`chunk upsert failed: ${upErr.message}`);
+
       ingested++;
     } catch (e: any) {
       failed++;
       errors.push({ productId: p?.id, error: "INGEST_FAILED", details: String(e?.message || e) });
     }
+
     if (delayMs) await sleep(delayMs);
   }
 
   const nextOffset = offset + slice.length;
-  const done = !products?.length || (typeof totalFound === "number" && nextOffset >= totalFound);
+  const done = (products || []).length === 0 || slice.length === 0;
 
   return Response.json({
     ok: true,
     mode: "batch",
-    totalFound,
     offset,
     limit,
     batchSize,
     nextOffset,
     done,
+    totalFound,
     ingested,
     failed,
     errors,
   });
-}
-
-export async function GET() {
-  return Response.json({ ok: true, route: "ingest-products", version: "v2-batch-compat" });
 }
