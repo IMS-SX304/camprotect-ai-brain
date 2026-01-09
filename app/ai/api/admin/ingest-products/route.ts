@@ -135,3 +135,7 @@ export async function POST(req: Request) {
     inserted_documents: docsToInsert.length,
   });
 }
+
+export async function GET() {
+  return Response.json({ ok: true, route: "ingest-products", version: "v2-batch" });
+}
