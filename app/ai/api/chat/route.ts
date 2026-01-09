@@ -20,15 +20,40 @@ function json(res: any, status = 200) {
   });
 }
 
-function clampInt(n: any, def: number, min: number, max: number) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return def;
-  return Math.max(min, Math.min(max, Math.trunc(v)));
+function normalizeText(s: any) {
+  return String(s ?? "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // retire accents
+    .replace(/[^\p{L}\p{N}\s\-\/]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function makeTerms(input: string) {
+  const norm = normalizeText(input);
+
+  // on garde aussi les tokens de longueur 2 (ex: ip)
+  const raw = norm.split(/\s+/).filter(Boolean);
+
+  // stopwords minimal FR (on évite de polluer)
+  const stop = new Set([
+    "je", "jai", "j", "ai", "besoin", "d", "de", "du", "des", "un", "une", "pour",
+    "avec", "sans", "et", "ou", "la", "le", "les", "a", "au", "aux", "en",
+    "mon", "ma", "mes", "vos", "votre", "leurs", "ce", "cet", "cette",
+  ]);
+
+  const terms = raw
+    .filter((t) => !stop.has(t))
+    .filter((t) => t.length >= 2) // inclut "ip"
+    .slice(0, 15);
+
+  return terms;
 }
 
 /**
- * Extrait des besoins depuis une phrase utilisateur.
- * On fait simple (et robuste) : le modèle renvoie un JSON Need.
+ * Extrait des besoins depuis la phrase utilisateur.
+ * Réponse JSON stricte.
  */
 async function extractNeed(input: string): Promise<Need> {
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -72,57 +97,40 @@ Règles:
   }
 }
 
+function camprotectUrlFromSlug(slug?: string | null) {
+  const base = (process.env.CAMPROTECT_BASE_URL || "https://www.camprotect.fr").replace(/\/$/, "");
+  if (!slug) return null;
+  return `${base}/product/${slug}`;
+}
+
 /**
- * Recherche SQL “hybride simple”:
- * - On cherche dans products (name, product_reference/sku/slug)
- * - et dans product_chunks.chunk (RAG text)
- * On score naïvement par présence des termes.
+ * Recherche catalogue:
+ * - on récupère 250 produits (pas de filtre fragile)
+ * - scoring en JS sur: name/ref/sku/slug + chunks
+ * - fallback si 0 candidat: produit dont name contient enregistreur/nvr
  */
 async function findCandidates(input: string, need: Need, limit = 6) {
   const sb = supabaseAdmin();
+  const terms = makeTerms(input);
 
-  // mots clés utiles
-  const q = input.trim().toLowerCase();
-  const terms = q
-    .replace(/[^\p{L}\p{N}\s\-\/]/gu, " ")
-    .split(/\s+/)
-    .filter((t) => t.length >= 3)
-    .slice(0, 12);
-
-  // Filtre catégorie : on s’appuie sur payload/product_type si dispo
-  // (ça reste souple car tous les champs ne sont pas forcément normalisés)
-  const mustBeNvr = need.category === "nvr" ? true : false;
-
-  // 1) Récupère une base de produits "potentiels"
-  // Note: on ne fait pas de joint lourd; on tire 200 max puis on score côté JS.
-  let query = sb
+  // 1) produits (toujours)
+  const { data: products, error } = await sb
     .from("products")
-    .select("id, name, slug, url, product_reference, sku, brand, product_type, price, currency, payload")
+    .select("id, name, slug, url, product_reference, sku, brand, product_type, price, currency")
     .limit(250);
 
-  if (mustBeNvr) {
-    // Tentative de filtre : product_type contient nvr / enregistreur / ip
-    query = query.or(
-      "product_type.ilike.%nvr%,product_type.ilike.%enregistreur%,payload->>type.ilike.%nvr%,payload->>type.ilike.%enregistreur%"
-    );
-  }
-
-  const { data: products, error } = await query;
   if (error) throw new Error(error.message);
+  if (!products?.length) return { candidates: [], debug: { terms, productsCount: 0, chunksCount: 0 } };
 
-  if (!products?.length) return [];
-
-  // 2) Récupère des chunks correspondant au texte (limité)
-  // On récupère des chunks qui contiennent l’un des termes.
+  // 2) chunks (optionnel)
   let chunks: any[] = [];
   if (terms.length) {
-    // construit un OR ilike sur chunk
     const ors = terms.map((t) => `chunk.ilike.%${t}%`).join(",");
     const { data: c, error: ce } = await sb
       .from("product_chunks")
       .select("product_id, chunk")
       .or(ors)
-      .limit(600);
+      .limit(800);
     if (!ce && c) chunks = c;
   }
 
@@ -133,9 +141,12 @@ async function findCandidates(input: string, need: Need, limit = 6) {
     chunkByProduct.get(pid)!.push(String(c.chunk || ""));
   }
 
-  // 3) Score
+  // 3) scoring
+  const normTerms = terms.map((t) => normalizeText(t));
+
   const scored = products.map((p: any) => {
-    const hay =
+    const pid = Number(p.id);
+    const hay = normalizeText(
       [
         p.name,
         p.product_reference,
@@ -143,42 +154,71 @@ async function findCandidates(input: string, need: Need, limit = 6) {
         p.slug,
         p.brand,
         p.product_type,
-        ...(chunkByProduct.get(Number(p.id)) || []),
+        ...(chunkByProduct.get(pid) || []),
       ]
         .filter(Boolean)
         .join(" ")
-        .toLowerCase();
+    );
 
     let score = 0;
-    for (const t of terms) {
-      if (hay.includes(t)) score += 2;
+
+    for (const t of normTerms) {
+      if (t && hay.includes(t)) score += 2;
     }
 
-    // Boost si on a un match “enregistreur/ip/poe/4”
-    if (need.category === "nvr" && (hay.includes("nvr") || hay.includes("enregistreur"))) score += 3;
-    if (need.camera_type === "ip" && hay.includes("ip")) score += 2;
-    if (need.poe_required && hay.includes("poe")) score += 3;
-    if (need.channels_min && hay.includes(String(need.channels_min))) score += 2;
+    // boosts “métier”
+    if (need.category === "nvr") {
+      if (hay.includes("nvr") || hay.includes("enregistreur")) score += 4;
+      if (hay.includes("ip")) score += 2;
+    }
+    if (need.poe_required && hay.includes("poe")) score += 4;
+
+    // si le client mentionne "4" ou "4 canaux" -> on booste si présent
+    if (normalizeText(input).includes("4") && (hay.includes("4") || hay.includes("4ch") || hay.includes("4 canaux"))) {
+      score += 2;
+    }
 
     return { p, score };
   });
 
   scored.sort((a, b) => b.score - a.score);
 
-  return scored
-    .filter((x) => x.score > 0)
-    .slice(0, limit)
-    .map((x) => x.p);
+  let candidates = scored.filter((x) => x.score > 0).slice(0, limit).map((x) => x.p);
+
+  // 4) fallback si zéro: on sort les “enregistreurs/nvr”
+  if (candidates.length === 0) {
+    const fallback = products
+      .filter((p: any) => {
+        const n = normalizeText(p.name);
+        return n.includes("enregistreur") || n.includes("nvr");
+      })
+      .slice(0, limit)
+      .map((p: any) => p);
+
+    candidates = fallback;
+  }
+
+  // ensure url
+  candidates = candidates.map((p: any) => ({
+    ...p,
+    url: p.url || camprotectUrlFromSlug(p.slug),
+  }));
+
+  return {
+    candidates,
+    debug: {
+      terms,
+      productsCount: products.length,
+      chunksCount: chunks.length,
+    },
+  };
 }
 
 function formatProductLine(p: any) {
-  const ref = (p.product_reference || p.sku || "").trim();
+  const ref = String(p.product_reference || p.sku || "").trim();
   const price =
-    typeof p.price === "number"
-      ? ` — ${p.price.toFixed(2)} ${(p.currency || "EUR").toString()}`
-      : "";
-  const url = p.url || (p.slug ? `${(process.env.CAMPROTECT_BASE_URL || "https://www.camprotect.fr").replace(/\/$/, "")}/product/${p.slug}` : null);
-
+    typeof p.price === "number" ? ` — ${p.price.toFixed(2)} ${(p.currency || "EUR").toString()}` : "";
+  const url = p.url || null;
   return `- ${p.name}${ref ? ` — ${ref}` : ""}${price}${url ? `\n  ${url}` : ""}`;
 }
 
@@ -190,14 +230,14 @@ export async function POST(req: Request) {
   if (!input) return json({ ok: false, error: "Missing input" }, 400);
 
   const need = await extractNeed(input);
-  const candidates = await findCandidates(input, need, 6);
-
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const { candidates, debug: searchDebug } = await findCandidates(input, need, 6);
 
   const context =
     candidates.length > 0
       ? `Produits CamProtect pertinents:\n${candidates.map(formatProductLine).join("\n")}`
       : "Aucun produit trouvé dans le catalogue.";
+
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   const sys = `
 Tu es un conseiller e-commerce CamProtect (vidéosurveillance).
@@ -231,10 +271,14 @@ ${context}
   return json({
     ok: true,
     reply,
-    rag: { used: candidates.length > 0 ? 1 : 0, sources: candidates.map((p: any) => ({ id: p.id, url: p.url })) },
+    rag: {
+      used: candidates.length > 0 ? 1 : 0,
+      sources: candidates.map((p: any) => ({ id: p.id, url: p.url })),
+    },
     debug: debug
       ? {
           need,
+          search: searchDebug,
           candidates: candidates.map((p: any) => ({
             id: p.id,
             name: p.name,
