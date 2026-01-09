@@ -1,292 +1,253 @@
 // app/ai/api/chat/route.ts
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
-import { openaiJson } from "@/lib/openai";
+import { chatCompletion, CAMPROTECT_SYSTEM_PROMPT } from "@/lib/openai";
 
 export const runtime = "nodejs";
 
-type Need = {
-  category?: "nvr" | "dvr" | "camera" | "alarm" | "other";
-  channels_min?: number | null;
-  poe_required?: boolean | null;
-  camera_type?: "ip" | "analog" | null;
-  brand?: string | null;
-  budget_max?: number | null;
+type ChatBody = {
+  input: string;
+  conversationId?: string;
+  debug?: boolean;
 };
 
-function json(res: any, status = 200) {
-  return new Response(JSON.stringify(res), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+type Candidate = {
+  id: number;
+  title: string | null;
+  url: string | null;
+  price: number | null;
+  currency: string | null;
+  product_type: string | null;
+  sku: string | null;
+  channels: number | null;
+  poe: boolean;
+  ip: boolean;
+};
+
+function extractChannels(text: string): number | null {
+  if (!text) return null;
+
+  // "4 canaux", "8 canaux", "16 canaux"
+  const m1 = text.match(/(\d{1,2})\s*(canaux|ch)\b/i);
+  if (m1) return Number(m1[1]);
+
+  // "4CH", "8CH", "16CH"
+  const m2 = text.match(/\b(\d{1,2})\s*ch\b/i);
+  if (m2) return Number(m2[1]);
+
+  return null;
 }
 
-function normalizeText(s: any) {
-  return String(s ?? "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // retire accents
-    .replace(/[^\p{L}\p{N}\s\-\/]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+function detectNeed(input: string) {
+  const t = input.toLowerCase();
 
-function makeTerms(input: string) {
-  const norm = normalizeText(input);
+  const wantsRecorder =
+    t.includes("enregistreur") || t.includes("nvr") || t.includes("dvr") || t.includes("xvr");
 
-  // on garde aussi les tokens de longueur 2 (ex: ip)
-  const raw = norm.split(/\s+/).filter(Boolean);
+  const wantsIP = t.includes("ip") || t.includes("nvr");
+  const wantsPoE = t.includes("poe");
 
-  // stopwords minimal FR (on évite de polluer)
-  const stop = new Set([
-    "je", "jai", "j", "ai", "besoin", "d", "de", "du", "des", "un", "une", "pour",
-    "avec", "sans", "et", "ou", "la", "le", "les", "a", "au", "aux", "en",
-    "mon", "ma", "mes", "vos", "votre", "leurs", "ce", "cet", "cette",
-  ]);
+  const m = t.match(/(\d{1,2})\s*(cam(é|e)ras?|camera|canaux|ch)\b/i);
+  const channels = m ? Number(m[1]) : null;
 
-  const terms = raw
-    .filter((t) => !stop.has(t))
-    .filter((t) => t.length >= 2) // inclut "ip"
-    .slice(0, 15);
-
-  return terms;
-}
-
-/**
- * Extrait des besoins depuis la phrase utilisateur.
- * Réponse JSON stricte.
- */
-async function extractNeed(input: string): Promise<Need> {
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-  const sys = `
-Tu extrais des contraintes d'achat (vidéosurveillance) depuis une phrase client.
-Réponds UNIQUEMENT en JSON valide, sans texte autour.
-
-Schéma:
-{
-  "category": "nvr|dvr|camera|alarm|other",
-  "channels_min": number|null,
-  "poe_required": boolean|null,
-  "camera_type": "ip|analog"|null,
-  "brand": string|null,
-  "budget_max": number|null
-}
-
-Règles:
-- "enregistreur IP" => category:nvr, camera_type:ip
-- "DVR" / "analogique" => category:dvr, camera_type:analog
-- "PoE" => poe_required:true
-- si non précisé => null
-`;
-
-  const out = await openaiJson("chat/completions", {
-    model,
-    temperature: 0,
-    messages: [
-      { role: "system", content: sys.trim() },
-      { role: "user", content: input },
-    ],
-    response_format: { type: "json_object" },
-  });
-
-  const content = out?.choices?.[0]?.message?.content || "{}";
-  try {
-    return JSON.parse(content);
-  } catch {
-    return { category: "other" };
-  }
-}
-
-function camprotectUrlFromSlug(slug?: string | null) {
-  const base = (process.env.CAMPROTECT_BASE_URL || "https://www.camprotect.fr").replace(/\/$/, "");
-  if (!slug) return null;
-  return `${base}/product/${slug}`;
-}
-
-/**
- * Recherche catalogue:
- * - on récupère 250 produits (pas de filtre fragile)
- * - scoring en JS sur: name/ref/sku/slug + chunks
- * - fallback si 0 candidat: produit dont name contient enregistreur/nvr
- */
-async function findCandidates(input: string, need: Need, limit = 6) {
-  const sb = supabaseAdmin();
-  const terms = makeTerms(input);
-
-  // 1) produits (toujours)
-  const { data: products, error } = await sb
-    .from("products")
-    .select("id, name, slug, url, product_reference, sku, brand, product_type, price, currency")
-    .limit(250);
-
-  if (error) throw new Error(error.message);
-  if (!products?.length) return { candidates: [], debug: { terms, productsCount: 0, chunksCount: 0 } };
-
-  // 2) chunks (optionnel)
-  let chunks: any[] = [];
-  if (terms.length) {
-    const ors = terms.map((t) => `chunk.ilike.%${t}%`).join(",");
-    const { data: c, error: ce } = await sb
-      .from("product_chunks")
-      .select("product_id, chunk")
-      .or(ors)
-      .limit(800);
-    if (!ce && c) chunks = c;
-  }
-
-  const chunkByProduct = new Map<number, string[]>();
-  for (const c of chunks) {
-    const pid = Number(c.product_id);
-    if (!chunkByProduct.has(pid)) chunkByProduct.set(pid, []);
-    chunkByProduct.get(pid)!.push(String(c.chunk || ""));
-  }
-
-  // 3) scoring
-  const normTerms = terms.map((t) => normalizeText(t));
-
-  const scored = products.map((p: any) => {
-    const pid = Number(p.id);
-    const hay = normalizeText(
-      [
-        p.name,
-        p.product_reference,
-        p.sku,
-        p.slug,
-        p.brand,
-        p.product_type,
-        ...(chunkByProduct.get(pid) || []),
-      ]
-        .filter(Boolean)
-        .join(" ")
-    );
-
-    let score = 0;
-
-    for (const t of normTerms) {
-      if (t && hay.includes(t)) score += 2;
-    }
-
-    // boosts “métier”
-    if (need.category === "nvr") {
-      if (hay.includes("nvr") || hay.includes("enregistreur")) score += 4;
-      if (hay.includes("ip")) score += 2;
-    }
-    if (need.poe_required && hay.includes("poe")) score += 4;
-
-    // si le client mentionne "4" ou "4 canaux" -> on booste si présent
-    if (normalizeText(input).includes("4") && (hay.includes("4") || hay.includes("4ch") || hay.includes("4 canaux"))) {
-      score += 2;
-    }
-
-    return { p, score };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-
-  let candidates = scored.filter((x) => x.score > 0).slice(0, limit).map((x) => x.p);
-
-  // 4) fallback si zéro: on sort les “enregistreurs/nvr”
-  if (candidates.length === 0) {
-    const fallback = products
-      .filter((p: any) => {
-        const n = normalizeText(p.name);
-        return n.includes("enregistreur") || n.includes("nvr");
-      })
-      .slice(0, limit)
-      .map((p: any) => p);
-
-    candidates = fallback;
-  }
-
-  // ensure url
-  candidates = candidates.map((p: any) => ({
-    ...p,
-    url: p.url || camprotectUrlFromSlug(p.slug),
-  }));
+  // si l’utilisateur dit “pour 4 caméras”, on l’interprète comme un minimum de 4 canaux
+  const requestedChannels = channels && channels > 0 ? channels : null;
 
   return {
-    candidates,
-    debug: {
-      terms,
-      productsCount: products.length,
-      chunksCount: chunks.length,
-    },
+    wantsRecorder,
+    wantsIP,
+    wantsPoE,
+    requestedChannels,
   };
 }
 
-function formatProductLine(p: any) {
-  const ref = String(p.product_reference || p.sku || "").trim();
-  const price =
-    typeof p.price === "number" ? ` — ${p.price.toFixed(2)} ${(p.currency || "EUR").toString()}` : "";
-  const url = p.url || null;
-  return `- ${p.name}${ref ? ` — ${ref}` : ""}${price}${url ? `\n  ${url}` : ""}`;
+function pickBestRecorder(candidates: Candidate[], requestedChannels: number | null) {
+  if (!candidates.length) return { exact: null as Candidate | null, fallback: null as Candidate | null };
+
+  if (!requestedChannels) {
+    // si pas de demande de canaux, on prend le "plus petit" raisonnable (ex: 8 plutôt que 16 si possible)
+    const sorted = [...candidates].sort((a, b) => {
+      const ca = a.channels ?? 9999;
+      const cb = b.channels ?? 9999;
+      return ca - cb;
+    });
+    return { exact: sorted[0] ?? null, fallback: null };
+  }
+
+  // exact match
+  const exact = candidates.find((c) => c.channels === requestedChannels) ?? null;
+  if (exact) return { exact, fallback: null };
+
+  // fallback = prochain supérieur
+  const higher = candidates
+    .filter((c) => typeof c.channels === "number" && (c.channels as number) > requestedChannels)
+    .sort((a, b) => (a.channels as number) - (b.channels as number));
+
+  return { exact: null, fallback: higher[0] ?? null };
 }
 
 export async function POST(req: Request) {
-  const body = await req.json().catch(() => ({}));
-  const input = String(body?.input || "").trim();
-  const debug = Boolean(body?.debug);
+  try {
+    const body = (await req.json()) as ChatBody;
+    const input = (body.input || "").trim();
+    if (!input) return Response.json({ ok: false, error: "Missing input" }, { status: 400 });
 
-  if (!input) return json({ ok: false, error: "Missing input" }, 400);
+    const debug = !!body.debug;
+    const conversationId = body.conversationId ?? crypto.randomUUID();
 
-  const need = await extractNeed(input);
-  const { candidates, debug: searchDebug } = await findCandidates(input, need, 6);
+    const need = detectNeed(input);
 
-  const context =
-    candidates.length > 0
-      ? `Produits CamProtect pertinents:\n${candidates.map(formatProductLine).join("\n")}`
-      : "Aucun produit trouvé dans le catalogue.";
+    const supa = supabaseAdmin();
 
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+    // 1) Charger des candidats “enregistreurs”
+    // On évite d’attraper des caméras/accessoires.
+    // Si l’utilisateur parle IP/PoE -> on privilégie les NVR PoE (et on exclut DVR/XVR analogiques si possible).
+    const { data: raw, error } = await supa
+      .from("products")
+      .select("id,title,url,price,currency,product_type,sku,payload")
+      .limit(80);
 
-  const sys = `
-Tu es un conseiller e-commerce CamProtect (vidéosurveillance).
-Tu dois:
-- proposer 1 à 3 produits maximum si disponibles dans le contexte
-- expliquer brièvement pourquoi (usage réel)
-- poser 1 à 3 questions si des infos manquent (budget, HDD, 4K, PoE, etc.)
-- ne JAMAIS inventer un produit qui n'est pas dans le contexte
-- toujours inclure les liens CamProtect fournis
-`;
+    if (error) {
+      return Response.json({ ok: false, error: "Supabase query failed", details: error.message }, { status: 500 });
+    }
 
-  const user = `
-Demande client: ${input}
+    const rows = Array.isArray(raw) ? raw : [];
 
-Besoins extraits (interne): ${JSON.stringify(need)}
+    // 2) Construire & filtrer candidats
+    const candidatesAll: Candidate[] = rows
+      .map((r: any) => {
+        const title = (r.title || r.payload?.name || "").toString();
+        const productType = (r.product_type || "").toString();
+        const hay = `${title} ${productType} ${r.sku || ""}`.toLowerCase();
 
-${context}
-`;
+        const channels = extractChannels(title);
+        const poe = hay.includes("poe");
+        const ip = hay.includes("nvr") || hay.includes("ip");
 
-  const out = await openaiJson("chat/completions", {
-    model,
-    temperature: 0.2,
-    messages: [
-      { role: "system", content: sys.trim() },
-      { role: "user", content: user.trim() },
-    ],
-  });
+        return {
+          id: Number(r.id),
+          title: title || null,
+          url: (r.url || null) as string | null,
+          price: typeof r.price === "number" ? r.price : null,
+          currency: (r.currency || "EUR") as string | null,
+          product_type: productType || null,
+          sku: (r.sku || null) as string | null,
+          channels,
+          poe,
+          ip,
+        };
+      })
+      // garde seulement enregistreurs (NVR/DVR/XVR) via mots-clés titre/type
+      .filter((c) => {
+        const t = (c.title || "").toLowerCase();
+        const pt = (c.product_type || "").toLowerCase();
+        return (
+          t.includes("enregistreur") ||
+          t.includes("nvr") ||
+          t.includes("dvr") ||
+          t.includes("xvr") ||
+          pt.includes("nvr") ||
+          pt.includes("dvr") ||
+          pt.includes("xvr")
+        );
+      });
 
-  const reply = out?.choices?.[0]?.message?.content || "Je n’ai pas assez d’informations pour répondre.";
+    // Filtre spécifique si IP + PoE demandés : on veut NVR PoE (donc ip=true et poe=true)
+    let candidates = candidatesAll;
 
-  return json({
-    ok: true,
-    reply,
-    rag: {
-      used: candidates.length > 0 ? 1 : 0,
-      sources: candidates.map((p: any) => ({ id: p.id, url: p.url })),
-    },
-    debug: debug
-      ? {
-          need,
-          search: searchDebug,
-          candidates: candidates.map((p: any) => ({
-            id: p.id,
-            name: p.name,
-            product_reference: p.product_reference,
-            sku: p.sku,
-            url: p.url,
-          })),
-        }
-      : undefined,
-  });
+    if (need.wantsIP) candidates = candidates.filter((c) => c.ip);
+    if (need.wantsPoE) candidates = candidates.filter((c) => c.poe);
+
+    // Si ça a trop filtré (0 résultat), on relâche un peu : IP sans PoE etc.
+    if (!candidates.length && need.wantsIP) {
+      candidates = candidatesAll.filter((c) => c.ip);
+    }
+    if (!candidates.length) {
+      candidates = candidatesAll;
+    }
+
+    // 3) Choix meilleur match
+    const picked = pickBestRecorder(candidates, need.requestedChannels);
+
+    // Sources RAG = liste des candidats visibles (URLs exactes)
+    const ragSources = candidates.slice(0, 6).map((c) => ({ id: c.id, url: c.url }));
+
+    // 4) Construire contexte ultra-strict pour éviter URL inventée
+    const formatCandidate = (c: Candidate) => {
+      const priceStr =
+        typeof c.price === "number" ? `${c.price} ${c.currency || "EUR"}` : "Non affiché (voir page produit)";
+      return [
+        `ID: ${c.id}`,
+        `Titre: ${c.title || "N/A"}`,
+        `SKU: ${c.sku || "N/A"}`,
+        `Canaux: ${c.channels ?? "N/A"}`,
+        `PoE: ${c.poe ? "oui" : "non"}`,
+        `IP/NVR: ${c.ip ? "oui" : "non"}`,
+        `Prix: ${priceStr}`,
+        `URL EXACTE: ${c.url || "N/A"}`,
+      ].join("\n");
+    };
+
+    const exactBlock = picked.exact ? `\n[PRODUIT EXACT]\n${formatCandidate(picked.exact)}\n` : "";
+    const fallbackBlock = picked.fallback ? `\n[PRODUIT ALTERNATIF]\n${formatCandidate(picked.fallback)}\n` : "";
+
+    const policy = `
+RÈGLES CRITIQUES:
+- N’invente JAMAIS d’URL. Utilise UNIQUEMENT "URL EXACTE" telle quelle.
+- Si aucun produit EXACT n’existe (ex: demandé 4 canaux), dis-le explicitement, puis propose l'ALTERNATIF (ex: 8 canaux).
+- Affiche le PRIX si disponible; sinon écris "Prix : voir page produit".
+- Si l’utilisateur demande IP PoE => privilégie les NVR PoE.
+- Réponse courte, claire, orientée achat CamProtect.
+- Toujours terminer par 1 à 3 questions utiles (HDD, 4K, marques, etc.).
+`.trim();
+
+    const needSummary = `
+BESOIN CLIENT (détecté):
+- Enregistreur: ${need.wantsRecorder ? "oui" : "non"}
+- IP/NVR: ${need.wantsIP ? "oui" : "non"}
+- PoE: ${need.wantsPoE ? "oui" : "non"}
+- Canaux demandés (min): ${need.requestedChannels ?? "non précisé"}
+`.trim();
+
+    const context = `
+${policy}
+
+${needSummary}
+${exactBlock}
+${fallbackBlock}
+`.trim();
+
+    const messages = [
+      { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
+      { role: "system" as const, content: context },
+      { role: "user" as const, content: input },
+    ];
+
+    const reply = await chatCompletion(messages);
+
+    return Response.json({
+      ok: true,
+      conversationId,
+      reply,
+      rag: { used: candidates.length ? 1 : 0, sources: ragSources },
+      ...(debug
+        ? {
+            debug: {
+              need,
+              picked: {
+                exact: picked.exact ? { id: picked.exact.id, url: picked.exact.url, channels: picked.exact.channels } : null,
+                fallback: picked.fallback
+                  ? { id: picked.fallback.id, url: picked.fallback.url, channels: picked.fallback.channels }
+                  : null,
+              },
+              candidates: candidates.slice(0, 6),
+            },
+          }
+        : {}),
+    });
+  } catch (e: any) {
+    return Response.json(
+      { ok: false, error: "Internal error", details: e?.message || String(e) },
+      { status: 500 }
+    );
+  }
 }
