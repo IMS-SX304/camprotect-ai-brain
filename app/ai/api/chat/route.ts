@@ -14,12 +14,16 @@ type Candidate = {
   id: number;
   name: string | null;
   url: string | null;
-  price: number | null; // ✅ prix final HT (produit ou min variant)
+
+  // ✅ prix final HT (produit ou min variant) -> on affiche TTC dans la réponse
+  price: number | null;
   currency: string | null;
+
   product_type: string | null;
   sku: string | null;
 
-  fiche_technique_url?: string | null; // ✅ FT
+  // ✅ fiche technique (url)
+  fiche_technique_url?: string | null;
 
   channels: number | null;
   poe: boolean;
@@ -59,6 +63,7 @@ function detectNeed(input: string) {
 function pickBestRecorder(candidates: Candidate[], requestedChannels: number | null) {
   if (!candidates.length) return { exact: null as Candidate | null, fallback: null as Candidate | null };
 
+  // si pas de canaux demandés => plus petit nombre de canaux dispo
   if (!requestedChannels) {
     const sorted = [...candidates].sort((a, b) => {
       const ca = a.channels ?? 9999;
@@ -68,9 +73,11 @@ function pickBestRecorder(candidates: Candidate[], requestedChannels: number | n
     return { exact: sorted[0] ?? null, fallback: null };
   }
 
+  // exact match
   const exact = candidates.find((c) => c.channels === requestedChannels) ?? null;
   if (exact) return { exact, fallback: null };
 
+  // fallback : le plus petit > demandé
   const higher = candidates
     .filter((c) => typeof c.channels === "number" && (c.channels as number) > requestedChannels)
     .sort((a, b) => (a.channels as number) - (b.channels as number));
@@ -78,15 +85,19 @@ function pickBestRecorder(candidates: Candidate[], requestedChannels: number | n
   return { exact: null, fallback: higher[0] ?? null };
 }
 
-// ✅ HT -> TTC (20%)
-function toTTC(priceHT: number | null, rate = 0.2): number | null {
-  if (typeof priceHT !== "number") return null;
-  return Math.round(priceHT * (1 + rate) * 100) / 100;
+/** ---- Prix TTC helpers ---- */
+const TVA_RATE = 0.2;
+
+function round2(n: number) {
+  return Math.round(n * 100) / 100;
 }
 
-function formatMoneyFR(n: number): string {
-  // 112.7 => "112,70"
+function formatEuro(n: number) {
   return n.toFixed(2).replace(".", ",");
+}
+
+function priceTTC(priceHT: number) {
+  return round2(priceHT * (1 + TVA_RATE));
 }
 
 export async function POST(req: Request) {
@@ -118,10 +129,7 @@ export async function POST(req: Request) {
     const minPriceByProductId = new Map<number, number>();
 
     if (productIds.length) {
-      const { data: vars, error: vErr } = await supa
-        .from("product_variants")
-        .select("product_id,price")
-        .in("product_id", productIds);
+      const { data: vars, error: vErr } = await supa.from("product_variants").select("product_id,price").in("product_id", productIds);
 
       if (!vErr && Array.isArray(vars)) {
         for (const v of vars as any[]) {
@@ -135,6 +143,7 @@ export async function POST(req: Request) {
       }
     }
 
+    // 3) Build candidates (catalogue)
     const candidatesAll: Candidate[] = rows
       .map((r: any) => {
         const name = (r.name || r.payload?.name || "").toString();
@@ -149,28 +158,24 @@ export async function POST(req: Request) {
         const minVar = minPriceByProductId.get(pid) ?? null;
 
         // ✅ prix final HT : prix produit sinon min variant
-        const finalPriceHT =
-          typeof r.price === "number" ? r.price : (typeof minVar === "number" ? minVar : null);
+        const finalPrice = typeof r.price === "number" ? r.price : typeof minVar === "number" ? minVar : null;
 
         return {
           id: pid,
           name: name || null,
           url: (r.url || null) as string | null,
-
-          price: finalPriceHT,
+          price: finalPrice,
           currency: (r.currency || "EUR") as string | null,
           product_type: productType || null,
           sku: (r.sku || null) as string | null,
-
-          // ✅ IMPORTANT : on mappe la FT !
           fiche_technique_url: (r.fiche_technique_url || null) as string | null,
-
           channels,
           poe,
           ip,
           min_variant_price: minVar,
         };
       })
+      // ✅ pour l’instant: on filtre uniquement “enregistreurs”
       .filter((c) => {
         const t = (c.name || "").toLowerCase();
         const pt = (c.product_type || "").toLowerCase();
@@ -185,10 +190,12 @@ export async function POST(req: Request) {
         );
       });
 
+    // 4) Apply need filters
     let candidates = candidatesAll;
     if (need.wantsIP) candidates = candidates.filter((c) => c.ip);
     if (need.wantsPoE) candidates = candidates.filter((c) => c.poe);
 
+    // fallback: si vide, on relâche PoE puis IP
     if (!candidates.length && need.wantsIP) {
       candidates = candidatesAll.filter((c) => c.ip);
     }
@@ -200,45 +207,53 @@ export async function POST(req: Request) {
 
     const ragSources = candidates.slice(0, 6).map((c) => ({ id: c.id, url: c.url }));
 
-    const formatPriceTTC = (c: Candidate) => {
-      const ttc = toTTC(c.price, 0.2);
-      if (typeof ttc === "number") return `${formatMoneyFR(ttc)} ${c.currency || "EUR"} TTC`;
-      return "Prix : voir page produit";
+    const formatPrice = (c: Candidate) => {
+      if (typeof c.price === "number") {
+        const ttc = priceTTC(c.price);
+        return `${formatEuro(ttc)} € TTC`;
+      }
+      return "Voir page produit";
     };
 
     const formatCandidate = (c: Candidate) => {
-      const lines = [
+      return [
         `ID: ${c.id}`,
         `Nom: ${c.name || "N/A"}`,
         `SKU: ${c.sku || "N/A"}`,
         `Canaux: ${c.channels ?? "N/A"}`,
         `PoE: ${c.poe ? "oui" : "non"}`,
         `IP/NVR: ${c.ip ? "oui" : "non"}`,
-        `Prix TTC: ${formatPriceTTC(c)}`,
+        `Prix: ${formatPrice(c)}`,
         `URL EXACTE: ${c.url || "N/A"}`,
-      ];
-
-      // ✅ FT pour contexte LLM
-      if (c.fiche_technique_url) lines.push(`FICHE TECHNIQUE URL: ${c.fiche_technique_url}`);
-
-      return lines.join("\n");
+        `FICHE TECHNIQUE: ${c.fiche_technique_url || "N/A"}`,
+      ].join("\n");
     };
 
     const policy = `
-FORMAT DE RÉPONSE OBLIGATOIRE:
-1) "✅ Produit recommandé" (si exact) ou "ℹ️ Alternative proposée" (si pas exact)
-2) 3 à 8 lignes max: nom, canaux, PoE, prix TTC, lien
-3) Si l'utilisateur demande 4 canaux et qu'on propose 8: dire explicitement
-   "Nous n’avons pas de 4 canaux PoE IP, voici la meilleure alternative 8 canaux."
-4) N’invente JAMAIS d’URL. Utilise UNIQUEMENT "URL EXACTE".
-5) Affiche le prix en TTC si présent, sinon "Prix : voir page produit".
-6) Si "FICHE TECHNIQUE URL" est présent, ajouter une ligne:
-   "📄 Fiche technique : <lien>"
-7) Toujours finir par 2-3 questions (HDD, 4K, marque, caméras existantes).
+FORMAT DE RÉPONSE OBLIGATOIRE (FR, ton pro e-commerce):
+- 1ère ligne: "✅ Produit recommandé" si exact, sinon "ℹ️ Alternative proposée"
+- Ensuite 4 à 7 lignes MAX, au format:
+  Nom :
+  Canaux :
+  PoE :
+  Prix : (toujours en € TTC si dispo, sinon "voir page produit")
+  Lien : (utilise UNIQUEMENT "URL EXACTE")
+  📄 Fiche technique : (si "FICHE TECHNIQUE" est une URL, sinon ne pas afficher la ligne)
+
+RÈGLES IMPORTANTES:
+1) Si le client demande X canaux et qu'on propose >X, tu dois écrire explicitement:
+   "Nous n’avons pas de X canaux correspondant, voici la meilleure alternative en Y canaux."
+2) Ne JAMAIS inventer d’URL. Tu dois reprendre UNIQUEMENT "URL EXACTE".
+3) Ne JAMAIS inventer une fiche technique. Utilise UNIQUEMENT "FICHE TECHNIQUE" si c'est une URL.
+4) Termine par EXACTEMENT 2 à 3 questions courtes pour qualifier:
+   - caméras déjà en place (marque/modèle)
+   - stockage (jours souhaités / HDD)
+   - résolution (4K vs 1080p) ou budget
 `.trim();
 
     const needSummary = `
 BESOIN CLIENT:
+- Enregistreur: ${need.wantsRecorder ? "oui" : "non"}
 - IP/NVR: ${need.wantsIP ? "oui" : "non"}
 - PoE: ${need.wantsPoE ? "oui" : "non"}
 - Canaux demandés: ${need.requestedChannels ?? "non précisé"}
@@ -263,13 +278,11 @@ ${fallbackBlock}
 
     const reply = await chatCompletion(messages);
 
-    const used = picked.exact || picked.fallback ? 1 : 0;
-
     return Response.json({
       ok: true,
       conversationId,
       reply,
-      rag: { used, sources: ragSources },
+      rag: { used: candidates.length ? 1 : 0, sources: ragSources },
       ...(debug
         ? {
             debug: {
@@ -281,7 +294,7 @@ ${fallbackBlock}
                       url: picked.exact.url,
                       channels: picked.exact.channels,
                       price: picked.exact.price,
-                      fiche_technique_url: picked.exact.fiche_technique_url ?? null,
+                      fiche_technique_url: picked.exact.fiche_technique_url,
                     }
                   : null,
                 fallback: picked.fallback
@@ -290,7 +303,7 @@ ${fallbackBlock}
                       url: picked.fallback.url,
                       channels: picked.fallback.channels,
                       price: picked.fallback.price,
-                      fiche_technique_url: picked.fallback.fiche_technique_url ?? null,
+                      fiche_technique_url: picked.fallback.fiche_technique_url,
                     }
                   : null,
               },
