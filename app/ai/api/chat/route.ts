@@ -18,7 +18,7 @@ type Candidate = {
   currency: string | null;
   product_type: string | null;
   sku: string | null;
-
+  fiche_technique_url?: string | null;
   channels: number | null;
   poe: boolean;
   ip: boolean;
