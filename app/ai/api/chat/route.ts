@@ -14,23 +14,24 @@ type Candidate = {
   id: number;
   name: string | null;
   url: string | null;
-  price: number | null;
+  price: number | null;        // ✅ prix final (produit ou min variant)
   currency: string | null;
   product_type: string | null;
   sku: string | null;
+
   channels: number | null;
   poe: boolean;
   ip: boolean;
+
+  // debug only
+  min_variant_price?: number | null;
 };
 
 function extractChannels(text: string): number | null {
   if (!text) return null;
 
-  const m1 = text.match(/(\d{1,2})\s*(canaux|ch)\b/i);
+  const m1 = text.match(/(\d{1,2})\s*(canaux|ch|voies)\b/i);
   if (m1) return Number(m1[1]);
-
-  const m2 = text.match(/\b(\d{1,2})\s*ch\b/i);
-  if (m2) return Number(m2[1]);
 
   return null;
 }
@@ -44,7 +45,7 @@ function detectNeed(input: string) {
   const wantsIP = t.includes("ip") || t.includes("nvr");
   const wantsPoE = t.includes("poe");
 
-  const m = t.match(/(\d{1,2})\s*(cam(é|e)ras?|camera|canaux|ch)\b/i);
+  const m = t.match(/(\d{1,2})\s*(cam(é|e)ras?|camera|canaux|ch|voies)\b/i);
   const channels = m ? Number(m[1]) : null;
 
   return {
@@ -87,20 +88,42 @@ export async function POST(req: Request) {
     const conversationId = body.conversationId ?? crypto.randomUUID();
 
     const need = detectNeed(input);
-
     const supa = supabaseAdmin();
 
-    // ✅ FIX: on sélectionne "name" (pas "title")
+    // 1) Load products
     const { data: raw, error } = await supa
       .from("products")
       .select("id,name,url,price,currency,product_type,sku,payload")
-      .limit(200);
+      .limit(300);
 
     if (error) {
       return Response.json({ ok: false, error: "Supabase query failed", details: error.message }, { status: 500 });
     }
 
     const rows = Array.isArray(raw) ? raw : [];
+    const productIds = rows.map((r: any) => Number(r.id)).filter((n) => Number.isFinite(n));
+
+    // 2) Load min price per product from variants (fallback)
+    const minPriceByProductId = new Map<number, number>();
+
+    if (productIds.length) {
+      // on récupère (product_id, price) puis on calcule le min en JS (simple et robuste)
+      const { data: vars, error: vErr } = await supa
+        .from("product_variants")
+        .select("product_id,price")
+        .in("product_id", productIds);
+
+      if (!vErr && Array.isArray(vars)) {
+        for (const v of vars as any[]) {
+          const pid = Number(v.product_id);
+          const p = typeof v.price === "number" ? v.price : null;
+          if (!Number.isFinite(pid) || p === null) continue;
+
+          const prev = minPriceByProductId.get(pid);
+          if (prev === undefined || p < prev) minPriceByProductId.set(pid, p);
+        }
+      }
+    }
 
     const candidatesAll: Candidate[] = rows
       .map((r: any) => {
@@ -112,17 +135,25 @@ export async function POST(req: Request) {
         const poe = hay.includes("poe");
         const ip = hay.includes("nvr") || hay.includes("ip");
 
+        const pid = Number(r.id);
+        const minVar = minPriceByProductId.get(pid) ?? null;
+
+        // ✅ prix final : prix produit sinon min variant
+        const finalPrice =
+          typeof r.price === "number" ? r.price : (typeof minVar === "number" ? minVar : null);
+
         return {
-          id: Number(r.id),
+          id: pid,
           name: name || null,
           url: (r.url || null) as string | null,
-          price: typeof r.price === "number" ? r.price : null,
+          price: finalPrice,
           currency: (r.currency || "EUR") as string | null,
           product_type: productType || null,
           sku: (r.sku || null) as string | null,
           channels,
           poe,
           ip,
+          min_variant_price: minVar,
         };
       })
       .filter((c) => {
@@ -140,7 +171,6 @@ export async function POST(req: Request) {
       });
 
     let candidates = candidatesAll;
-
     if (need.wantsIP) candidates = candidates.filter((c) => c.ip);
     if (need.wantsPoE) candidates = candidates.filter((c) => c.poe);
 
@@ -155,9 +185,12 @@ export async function POST(req: Request) {
 
     const ragSources = candidates.slice(0, 6).map((c) => ({ id: c.id, url: c.url }));
 
+    const formatPrice = (c: Candidate) => {
+      if (typeof c.price === "number") return `${c.price} ${c.currency || "EUR"}`;
+      return "Voir page produit";
+    };
+
     const formatCandidate = (c: Candidate) => {
-      const priceStr =
-        typeof c.price === "number" ? `${c.price} ${c.currency || "EUR"}` : "Non affiché (voir page produit)";
       return [
         `ID: ${c.id}`,
         `Nom: ${c.name || "N/A"}`,
@@ -165,31 +198,30 @@ export async function POST(req: Request) {
         `Canaux: ${c.channels ?? "N/A"}`,
         `PoE: ${c.poe ? "oui" : "non"}`,
         `IP/NVR: ${c.ip ? "oui" : "non"}`,
-        `Prix: ${priceStr}`,
+        `Prix: ${formatPrice(c)}`,
         `URL EXACTE: ${c.url || "N/A"}`,
       ].join("\n");
     };
 
-    const exactBlock = picked.exact ? `\n[PRODUIT EXACT]\n${formatCandidate(picked.exact)}\n` : "";
-    const fallbackBlock = picked.fallback ? `\n[PRODUIT ALTERNATIF]\n${formatCandidate(picked.fallback)}\n` : "";
-
     const policy = `
-RÈGLES CRITIQUES:
-- N’invente JAMAIS d’URL. Utilise UNIQUEMENT "URL EXACTE" telle quelle.
-- Si aucun produit EXACT n’existe (ex: demandé 4 canaux), dis-le explicitement, puis propose l'ALTERNATIF (ex: 8 canaux).
-- Affiche le PRIX si disponible; sinon écris "Prix : voir page produit".
-- Si l’utilisateur demande IP PoE => privilégie les NVR PoE.
-- Réponse courte, claire, orientée achat CamProtect.
-- Toujours terminer par 1 à 3 questions utiles (HDD, 4K, marques, etc.).
+FORMAT DE RÉPONSE OBLIGATOIRE:
+1) "✅ Produit recommandé" (si exact) ou "ℹ️ Alternative proposée" (si pas exact)
+2) 3 à 6 lignes max: nom, canaux, PoE, prix, lien
+3) Si l'utilisateur demande 4 canaux et qu'on propose 8: dire explicitement "Nous n’avons pas de 4 canaux PoE IP, voici la meilleure alternative 8 canaux."
+4) N’invente JAMAIS d’URL. Utilise UNIQUEMENT "URL EXACTE".
+5) Affiche le prix si présent, sinon "Prix : voir page produit".
+6) Toujours finir par 2-3 questions (HDD, 4K, marque, caméras existantes).
 `.trim();
 
     const needSummary = `
-BESOIN CLIENT (détecté):
-- Enregistreur: ${need.wantsRecorder ? "oui" : "non"}
+BESOIN CLIENT:
 - IP/NVR: ${need.wantsIP ? "oui" : "non"}
 - PoE: ${need.wantsPoE ? "oui" : "non"}
-- Canaux demandés (min): ${need.requestedChannels ?? "non précisé"}
+- Canaux demandés: ${need.requestedChannels ?? "non précisé"}
 `.trim();
+
+    const exactBlock = picked.exact ? `\n[PRODUIT EXACT]\n${formatCandidate(picked.exact)}\n` : "";
+    const fallbackBlock = picked.fallback ? `\n[PRODUIT ALTERNATIF]\n${formatCandidate(picked.fallback)}\n` : "";
 
     const context = `
 ${policy}
@@ -217,9 +249,11 @@ ${fallbackBlock}
             debug: {
               need,
               picked: {
-                exact: picked.exact ? { id: picked.exact.id, url: picked.exact.url, channels: picked.exact.channels } : null,
+                exact: picked.exact
+                  ? { id: picked.exact.id, url: picked.exact.url, channels: picked.exact.channels, price: picked.exact.price }
+                  : null,
                 fallback: picked.fallback
-                  ? { id: picked.fallback.id, url: picked.fallback.url, channels: picked.fallback.channels }
+                  ? { id: picked.fallback.id, url: picked.fallback.url, channels: picked.fallback.channels, price: picked.fallback.price }
                   : null,
               },
               candidates: candidates.slice(0, 6),
@@ -228,9 +262,6 @@ ${fallbackBlock}
         : {}),
     });
   } catch (e: any) {
-    return Response.json(
-      { ok: false, error: "Internal error", details: e?.message || String(e) },
-      { status: 500 }
-    );
+    return Response.json({ ok: false, error: "Internal error", details: e?.message || String(e) }, { status: 500 });
   }
 }
