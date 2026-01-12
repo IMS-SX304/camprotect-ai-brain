@@ -93,7 +93,7 @@ export async function POST(req: Request) {
     // 1) Load products
     const { data: raw, error } = await supa
       .from("products")
-      .select("id,name,url,price,currency,product_type,sku,payload")
+      .select("id,name,url,price,currency,product_type,sku,fiche_technique_url,payload")
       .limit(300);
 
     if (error) {
