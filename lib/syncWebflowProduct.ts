@@ -22,31 +22,25 @@ type WebflowProduct = {
     name?: string;
     slug?: string;
     description?: string;
-    "description-mini"?: string;
-    "description-complete"?: string;
-    brand?: string;
-    fabricants?: string;
-    "product-reference"?: string;
-    "code-fabricant"?: string;
+
+    // champs CMS (exemples)
     altword?: string;
     "benefice-court"?: string;
     "meta-description"?: string;
-    "fiche-technique-du-produit"?: { url?: string } | null;
-    "sku-properties"?: Array<{
-      id: string;
-      name: string;
-      enum: Array<{ id: string; name: string; slug: string }>;
-    }>;
+
+    // ⚠️ suivant ton CMS, ce champ peut être différent
+    // on va l'extraire de façon robuste via payload
+    "fiche-technique-du-produit"?: any;
+
+    "product-reference"?: string;
+    "code-fabricant"?: string;
+
     "default-sku"?: string;
   };
 };
 
 function toMoney(price?: WebflowPrice | null): number | null {
   if (!price || typeof price.value !== "number") return null;
-
-  // Règle robuste:
-  // - si value >= 1000 => on suppose cents (24354 => 243.54)
-  // - sinon => on suppose déjà en unité
   const v = price.value;
   if (v >= 1000) return Math.round(v) / 100;
   return v;
@@ -58,11 +52,35 @@ function camprotectUrlFromSlug(slug?: string | null): string | null {
   return `${base}/product/${slug}`;
 }
 
+// Extraction robuste de l'URL depuis un champ Webflow (string | {url} | [{url}] | {href})
+function extractUrl(value: any): string | null {
+  if (!value) return null;
+
+  if (typeof value === "string") {
+    const s = value.trim();
+    return s ? s : null;
+  }
+
+  // tableau: prend le premier
+  if (Array.isArray(value)) {
+    const first = value[0];
+    return extractUrl(first);
+  }
+
+  // objet
+  if (typeof value === "object") {
+    if (typeof value.url === "string" && value.url.trim()) return value.url.trim();
+    if (typeof value.href === "string" && value.href.trim()) return value.href.trim();
+  }
+
+  return null;
+}
+
 export async function syncWebflowProduct(webflowProductId: string) {
   const siteId = process.env.WEBFLOW_SITE_ID;
   if (!siteId) throw new Error("Missing WEBFLOW_SITE_ID");
 
-  // 1) Récupération produit + variantes (skus)
+  // 1) Récupération produit + skus
   const data = await webflowJson(`/sites/${siteId}/products/${webflowProductId}`, { method: "GET" });
 
   const product: WebflowProduct | undefined = data?.product;
@@ -74,21 +92,31 @@ export async function syncWebflowProduct(webflowProductId: string) {
   const slug = (pfd.slug || "").trim();
   const url = camprotectUrlFromSlug(slug);
 
-  // SKU "principal" (utile pour recherche par ref) :
-  // on prend le sku de la variante "default" si possible, sinon le 1er sku.
+  // SKU principal
   const defaultSkuId = pfd["default-sku"];
   const defaultSku = skus.find((s) => s.id === defaultSkuId) || skus[0];
+
   const skuCode =
     (defaultSku?.fieldData?.sku ||
       pfd["product-reference"] ||
       pfd["code-fabricant"] ||
       "").trim() || null;
 
-  // Prix "à partir de" = min des variantes
+  // Prix min des variantes
   const prices = skus
     .map((s) => toMoney(s.fieldData?.price ?? null))
     .filter((x): x is number => typeof x === "number");
   const minPrice = prices.length ? Math.min(...prices) : null;
+
+  // ✅ FICHE TECHNIQUE (robuste)
+  // IMPORTANT: suivant ton Webflow, la donnée peut aussi être dans data.product.fieldData["fiche-technique-du-produit"]
+  const ftAny =
+    (pfd as any)["fiche-technique-du-produit"] ??
+    (pfd as any)["fiche-technique"] ??
+    (pfd as any)["datasheet"] ??
+    null;
+
+  const ficheTechUrl = extractUrl(ftAny);
 
   const supa = supabaseAdmin();
 
@@ -96,26 +124,30 @@ export async function syncWebflowProduct(webflowProductId: string) {
   const productRow: any = {
     webflow_product_id: product.id,
     slug: slug || null,
-    url: url,
-    title: (pfd.name || "").trim() || null,
+    url: url || null,
+
+    name: (pfd.name || "").trim() || null,
     description: (pfd.description || "").trim() || null,
 
-    // ⚠️ Ces colonnes doivent exister (tu m’as dit que oui)
     sku: skuCode,
     price: minPrice,
     currency: "EUR",
 
-    // Champs CMS utiles IA
     altword: (pfd.altword || "").trim() || null,
     benefice_court: (pfd["benefice-court"] || "").trim() || null,
     meta_description: (pfd["meta-description"] || "").trim() || null,
-    fiche_technique_url: (pfd["fiche-technique-du-produit"] as any)?.url || null,
 
-    // Payload complet (jsonb)
+    // ✅ colonne déjà présente chez toi
+    fiche_technique_url: ficheTechUrl,
+
+    // JSON brut
     payload: {
       ...pfd,
       camprotect_url: url,
+      fiche_technique_url: ficheTechUrl, // pratique pour debug
     },
+
+    updated_at: new Date().toISOString(),
   };
 
   const { data: upProd, error: upProdErr } = await supa
@@ -124,9 +156,7 @@ export async function syncWebflowProduct(webflowProductId: string) {
     .select("id")
     .single();
 
-  if (upProdErr) {
-    throw new Error(`Supabase products upsert failed: ${upProdErr.message}`);
-  }
+  if (upProdErr) throw new Error(`Supabase products upsert failed: ${upProdErr.message}`);
 
   const productId = upProd?.id;
   if (!productId) throw new Error("Supabase products upsert did not return id");
@@ -137,16 +167,19 @@ export async function syncWebflowProduct(webflowProductId: string) {
     return {
       webflow_sku_id: s.id,
       webflow_product_id: product.id,
-      product_id: productId, // évite NOT NULL
+      product_id: productId,
+
       sku: (sfd.sku || "").trim() || null,
-      title: (sfd.name || "").trim() || null,
+      name: (sfd.name || "").trim() || null,
       slug: (sfd.slug || "").trim() || null,
+
       price: toMoney(sfd.price ?? null),
       currency: (sfd.price?.unit || "EUR").toString(),
 
-      // jsonb recommandé
       option_values: sfd["sku-values"] || null,
       payload: sfd,
+
+      updated_at: new Date().toISOString(),
     };
   });
 
@@ -155,10 +188,8 @@ export async function syncWebflowProduct(webflowProductId: string) {
       .from("product_variants")
       .upsert(variantRows, { onConflict: "webflow_sku_id" });
 
-    if (upVarErr) {
-      throw new Error(`Supabase variants upsert failed: ${upVarErr.message}`);
-    }
+    if (upVarErr) throw new Error(`Supabase variants upsert failed: ${upVarErr.message}`);
   }
 
-  return { ok: true, productId, variants: variantRows.length };
+  return { ok: true, productId, variants: variantRows.length, ficheTechUrl };
 }
