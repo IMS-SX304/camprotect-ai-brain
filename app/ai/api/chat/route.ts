@@ -12,7 +12,7 @@ type ChatBody = {
 
 type Candidate = {
   id: number;
-  title: string | null;
+  name: string | null;
   url: string | null;
   price: number | null;
   currency: string | null;
@@ -26,11 +26,9 @@ type Candidate = {
 function extractChannels(text: string): number | null {
   if (!text) return null;
 
-  // "4 canaux", "8 canaux", "16 canaux"
   const m1 = text.match(/(\d{1,2})\s*(canaux|ch)\b/i);
   if (m1) return Number(m1[1]);
 
-  // "4CH", "8CH", "16CH"
   const m2 = text.match(/\b(\d{1,2})\s*ch\b/i);
   if (m2) return Number(m2[1]);
 
@@ -49,14 +47,11 @@ function detectNeed(input: string) {
   const m = t.match(/(\d{1,2})\s*(cam(é|e)ras?|camera|canaux|ch)\b/i);
   const channels = m ? Number(m[1]) : null;
 
-  // si l’utilisateur dit “pour 4 caméras”, on l’interprète comme un minimum de 4 canaux
-  const requestedChannels = channels && channels > 0 ? channels : null;
-
   return {
     wantsRecorder,
     wantsIP,
     wantsPoE,
-    requestedChannels,
+    requestedChannels: channels && channels > 0 ? channels : null,
   };
 }
 
@@ -64,7 +59,6 @@ function pickBestRecorder(candidates: Candidate[], requestedChannels: number | n
   if (!candidates.length) return { exact: null as Candidate | null, fallback: null as Candidate | null };
 
   if (!requestedChannels) {
-    // si pas de demande de canaux, on prend le "plus petit" raisonnable (ex: 8 plutôt que 16 si possible)
     const sorted = [...candidates].sort((a, b) => {
       const ca = a.channels ?? 9999;
       const cb = b.channels ?? 9999;
@@ -73,11 +67,9 @@ function pickBestRecorder(candidates: Candidate[], requestedChannels: number | n
     return { exact: sorted[0] ?? null, fallback: null };
   }
 
-  // exact match
   const exact = candidates.find((c) => c.channels === requestedChannels) ?? null;
   if (exact) return { exact, fallback: null };
 
-  // fallback = prochain supérieur
   const higher = candidates
     .filter((c) => typeof c.channels === "number" && (c.channels as number) > requestedChannels)
     .sort((a, b) => (a.channels as number) - (b.channels as number));
@@ -98,13 +90,11 @@ export async function POST(req: Request) {
 
     const supa = supabaseAdmin();
 
-    // 1) Charger des candidats “enregistreurs”
-    // On évite d’attraper des caméras/accessoires.
-    // Si l’utilisateur parle IP/PoE -> on privilégie les NVR PoE (et on exclut DVR/XVR analogiques si possible).
+    // ✅ FIX: on sélectionne "name" (pas "title")
     const { data: raw, error } = await supa
       .from("products")
-      .select("id,title,url,price,currency,product_type,sku,payload")
-      .limit(80);
+      .select("id,name,url,price,currency,product_type,sku,payload")
+      .limit(200);
 
     if (error) {
       return Response.json({ ok: false, error: "Supabase query failed", details: error.message }, { status: 500 });
@@ -112,20 +102,19 @@ export async function POST(req: Request) {
 
     const rows = Array.isArray(raw) ? raw : [];
 
-    // 2) Construire & filtrer candidats
     const candidatesAll: Candidate[] = rows
       .map((r: any) => {
-        const title = (r.title || r.payload?.name || "").toString();
+        const name = (r.name || r.payload?.name || "").toString();
         const productType = (r.product_type || "").toString();
-        const hay = `${title} ${productType} ${r.sku || ""}`.toLowerCase();
+        const hay = `${name} ${productType} ${r.sku || ""}`.toLowerCase();
 
-        const channels = extractChannels(title);
+        const channels = extractChannels(name);
         const poe = hay.includes("poe");
         const ip = hay.includes("nvr") || hay.includes("ip");
 
         return {
           id: Number(r.id),
-          title: title || null,
+          name: name || null,
           url: (r.url || null) as string | null,
           price: typeof r.price === "number" ? r.price : null,
           currency: (r.currency || "EUR") as string | null,
@@ -136,9 +125,8 @@ export async function POST(req: Request) {
           ip,
         };
       })
-      // garde seulement enregistreurs (NVR/DVR/XVR) via mots-clés titre/type
       .filter((c) => {
-        const t = (c.title || "").toLowerCase();
+        const t = (c.name || "").toLowerCase();
         const pt = (c.product_type || "").toLowerCase();
         return (
           t.includes("enregistreur") ||
@@ -151,13 +139,11 @@ export async function POST(req: Request) {
         );
       });
 
-    // Filtre spécifique si IP + PoE demandés : on veut NVR PoE (donc ip=true et poe=true)
     let candidates = candidatesAll;
 
     if (need.wantsIP) candidates = candidates.filter((c) => c.ip);
     if (need.wantsPoE) candidates = candidates.filter((c) => c.poe);
 
-    // Si ça a trop filtré (0 résultat), on relâche un peu : IP sans PoE etc.
     if (!candidates.length && need.wantsIP) {
       candidates = candidatesAll.filter((c) => c.ip);
     }
@@ -165,19 +151,16 @@ export async function POST(req: Request) {
       candidates = candidatesAll;
     }
 
-    // 3) Choix meilleur match
     const picked = pickBestRecorder(candidates, need.requestedChannels);
 
-    // Sources RAG = liste des candidats visibles (URLs exactes)
     const ragSources = candidates.slice(0, 6).map((c) => ({ id: c.id, url: c.url }));
 
-    // 4) Construire contexte ultra-strict pour éviter URL inventée
     const formatCandidate = (c: Candidate) => {
       const priceStr =
         typeof c.price === "number" ? `${c.price} ${c.currency || "EUR"}` : "Non affiché (voir page produit)";
       return [
         `ID: ${c.id}`,
-        `Titre: ${c.title || "N/A"}`,
+        `Nom: ${c.name || "N/A"}`,
         `SKU: ${c.sku || "N/A"}`,
         `Canaux: ${c.channels ?? "N/A"}`,
         `PoE: ${c.poe ? "oui" : "non"}`,
