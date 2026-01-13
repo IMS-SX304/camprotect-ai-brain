@@ -230,7 +230,7 @@ export async function POST(req: Request) {
     };
 
     const policy = `
-FORMAT DE RÉPONSE OBLIGATOIRE (FR, ton pro e-commerce):
+FORMAT DE RÉPONSE OBLIGATOIRE (FR, ton pro / conseiller):
 - 1ère ligne: "✅ Produit recommandé" si exact, sinon "ℹ️ Alternative proposée"
 - Ensuite 4 à 7 lignes MAX, au format:
   Nom :
@@ -241,14 +241,15 @@ FORMAT DE RÉPONSE OBLIGATOIRE (FR, ton pro e-commerce):
   📄 Fiche technique : (si "FICHE TECHNIQUE" est une URL, sinon ne pas afficher la ligne)
 
 RÈGLES IMPORTANTES:
-1) Si le client demande X canaux et qu'on propose >X, tu dois écrire explicitement:
+1) Si le client demande X canaux et qu'on propose >X, écrire explicitement:
    "Nous n’avons pas de X canaux correspondant, voici la meilleure alternative en Y canaux."
-2) Ne JAMAIS inventer d’URL. Tu dois reprendre UNIQUEMENT "URL EXACTE".
-3) Ne JAMAIS inventer une fiche technique. Utilise UNIQUEMENT "FICHE TECHNIQUE" si c'est une URL.
-4) Termine par EXACTEMENT 2 à 3 questions courtes pour qualifier:
-   - caméras déjà en place (marque/modèle)
+2) Ne JAMAIS inventer d’URL. Utiliser UNIQUEMENT "URL EXACTE".
+3) Ne JAMAIS inventer une fiche technique. Utiliser UNIQUEMENT "FICHE TECHNIQUE" si c'est une URL.
+4) Ne pas écrire "Procédez à l'achat" ou équivalent.
+5) Après le bloc produit, ajouter un mini-bloc "Pour affiner votre choix :" puis poser 2 à 3 questions courtes:
+   - compatibilité (caméras déjà en place : marque/modèle, IP ou analogique)
    - stockage (jours souhaités / HDD)
-   - résolution (4K vs 1080p) ou budget
+   - résolution (4K vs 1080p) OU budget
 `.trim();
 
     const needSummary = `
