@@ -1,107 +1,159 @@
-// app/ai/api/admin/sync-products/route.ts
+// lib/syncWebflowProduct.ts
 import { webflowJson } from "@/lib/webflow";
-import { syncWebflowProduct } from "@/lib/syncWebflowProduct";
+import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
-export const runtime = "nodejs";
-// si ton hébergeur/Next le supporte, ça évite certains timeouts
-export const maxDuration = 60;
+type WebflowPrice = { value: number; unit?: string };
 
-function assertAdmin(req: Request) {
-  const admin = process.env.ADMIN_TOKEN;
-  const got = req.headers.get("x-admin-token");
-  if (!admin || !got || got !== admin) {
-    return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), {
-      status: 401,
-      headers: { "content-type": "application/json" },
-    });
-  }
-  return null;
+type WebflowSku = {
+  id: string;
+  fieldData?: {
+    sku?: string;
+    name?: string;
+    slug?: string;
+    price?: WebflowPrice | null;
+    "compare-at-price"?: WebflowPrice | null;
+    "sku-values"?: Record<string, string>;
+  };
+};
+
+type WebflowProduct = {
+  id: string;
+  fieldData?: {
+    name?: string;
+    slug?: string;
+    description?: string;
+    "description-mini"?: string;
+    "description-complete"?: string;
+    fabricants?: string;
+    "product-reference"?: string;
+    "code-fabricant"?: string;
+    altword?: string;
+    "benefice-court"?: string;
+    "meta-description"?: string;
+    "fiche-technique-du-produit"?: { url?: string } | null;
+    "sku-properties"?: Array<{
+      id: string;
+      name: string;
+      enum: Array<{ id: string; name: string; slug: string }>;
+    }>;
+    "default-sku"?: string;
+    "type-de-produit"?: string;
+  };
+};
+
+function toMoney(price?: WebflowPrice | null): number | null {
+  if (!price || typeof price.value !== "number") return null;
+  const v = price.value;
+  // Webflow renvoie souvent en cents (>=1000 => 24354 = 243.54)
+  if (v >= 1000) return Math.round(v) / 100;
+  return v;
 }
 
-function clampInt(v: any, def: number, min: number, max: number) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return def;
-  return Math.max(min, Math.min(max, Math.trunc(n)));
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+function camprotectUrlFromSlug(slug?: string | null): string | null {
+  const base = (process.env.CAMPROTECT_BASE_URL || "https://www.camprotect.fr").replace(/\/$/, "");
+  if (!slug) return null;
+  return `${base}/product/${slug}`;
 }
 
 /**
- * POST /ai/api/admin/sync-products
- * Body optionnel:
- * {
- *   "offset": 0,
- *   "limit": 250,     // plafond webflow, MAIS on ne lira jamais plus que batchSize
- *   "batchSize": 10,  // combien on sync dans CET appel
- *   "delayMs": 120
- * }
+ * ✅ EXPORT IMPORTANT
  */
-export async function POST(req: Request) {
-  const unauth = assertAdmin(req);
-  if (unauth) return unauth;
-
+export async function syncWebflowProduct(webflowProductId: string) {
   const siteId = process.env.WEBFLOW_SITE_ID;
-  if (!siteId) {
-    return Response.json({ ok: false, error: "Missing WEBFLOW_SITE_ID" }, { status: 500 });
-  }
+  if (!siteId) throw new Error("Missing WEBFLOW_SITE_ID");
 
-  const body = await req.json().catch(() => ({}));
+  // GET product + skus
+  const data = await webflowJson(`/sites/${siteId}/products/${webflowProductId}`, { method: "GET" });
 
-  const offset = clampInt(body?.offset, 0, 0, 1_000_000);
-  const limit = clampInt(body?.limit, 250, 1, 250);
-  const batchSize = clampInt(body?.batchSize, 10, 1, 50);
-  const delayMs = clampInt(body?.delayMs, 120, 0, 2000);
+  const product: WebflowProduct | undefined = data?.product;
+  const skus: WebflowSku[] = Array.isArray(data?.skus) ? data.skus : [];
 
-  // ✅ IMPORTANT: on lit seulement ce qu'on va traiter
-  const readLimit = Math.min(limit, batchSize);
+  if (!product?.id) throw new Error("Webflow product payload missing product.id");
 
-  // 1) On récupère une mini-page Webflow (ex: 5/10 items)
-  const page = await webflowJson(
-    `/sites/${siteId}/products?offset=${offset}&limit=${readLimit}`,
-    { method: "GET" }
-  );
+  const pfd = product.fieldData || {};
+  const slug = (pfd.slug || "").trim();
+  const url = camprotectUrlFromSlug(slug);
 
-  const items = page?.items || [];
-  const totalFound = page?.pagination?.total ?? null;
+  // Default SKU -> référence principale
+  const defaultSkuId = pfd["default-sku"];
+  const defaultSku = skus.find((s) => s.id === defaultSkuId) || skus[0];
 
-  const errors: any[] = [];
-  let synced = 0;
-  let failed = 0;
+  const skuCode =
+    (defaultSku?.fieldData?.sku ||
+      pfd["product-reference"] ||
+      pfd["code-fabricant"] ||
+      "").trim() || null;
 
-  for (const it of items) {
-    const id = it?.product?.id || it?.id;
-    if (!id) continue;
+  // Prix "à partir de" = min des variantes
+  const prices = skus
+    .map((s) => toMoney(s.fieldData?.price ?? null))
+    .filter((x): x is number => typeof x === "number");
+  const minPrice = prices.length ? Math.min(...prices) : null;
 
-    try {
-      await syncWebflowProduct(id);
-      synced++;
-    } catch (e: any) {
-      failed++;
-      errors.push({ id, error: "SYNC_FAILED", details: String(e?.message || e) });
-    }
+  // fiche technique (champ upload Webflow)
+  const ficheTechUrl = (pfd["fiche-technique-du-produit"] as any)?.url || null;
 
-    if (delayMs) await sleep(delayMs);
-  }
+  const supa = supabaseAdmin();
 
-  const nextOffset = offset + items.length;
+  // UPSERT product
+  const productRow: any = {
+    webflow_product_id: product.id,
+    slug: slug || null,
+    url: url,
+    name: (pfd.name || "").trim() || null,
+    product_type: (pfd["type-de-produit"] || "").trim() || null,
 
-  const done =
-    items.length === 0 ||
-    (totalFound !== null && nextOffset >= totalFound);
+    sku: skuCode,
+    price: minPrice,
+    currency: "EUR",
 
-  return Response.json({
-    ok: true,
-    totalFound,
-    offset,
-    limit,
-    batchSize,
-    readLimit,
-    nextOffset,
-    done,
-    synced,
-    failed,
-    errors,
+    altword: (pfd.altword || "").trim() || null,
+    benefice_court: (pfd["benefice-court"] || "").trim() || null,
+    meta_description: (pfd["meta-description"] || "").trim() || null,
+    fiche_technique_url: ficheTechUrl,
+
+    payload: { ...pfd, camprotect_url: url },
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data: upProd, error: upProdErr } = await supa
+    .from("products")
+    .upsert(productRow, { onConflict: "webflow_product_id" })
+    .select("id")
+    .single();
+
+  if (upProdErr) throw new Error(`Supabase products upsert failed: ${upProdErr.message}`);
+
+  const productId = upProd?.id;
+  if (!productId) throw new Error("Supabase products upsert did not return id");
+
+  // UPSERT variants
+  const variantRows = skus.map((s) => {
+    const sfd = s.fieldData || {};
+    return {
+      webflow_sku_id: s.id,
+      webflow_product_id: product.id,
+      product_id: productId,
+
+      sku: (sfd.sku || "").trim() || null,
+      title: (sfd.name || "").trim() || null,
+      slug: (sfd.slug || "").trim() || null,
+      price: toMoney(sfd.price ?? null),
+      currency: (sfd.price?.unit || "EUR").toString(),
+
+      option_values: sfd["sku-values"] || null,
+      payload: sfd,
+      updated_at: new Date().toISOString(),
+    };
   });
+
+  if (variantRows.length) {
+    const { error: upVarErr } = await supa
+      .from("product_variants")
+      .upsert(variantRows, { onConflict: "webflow_sku_id" });
+
+    if (upVarErr) throw new Error(`Supabase variants upsert failed: ${upVarErr.message}`);
+  }
+
+  return { ok: true, productId, variants: variantRows.length };
 }
