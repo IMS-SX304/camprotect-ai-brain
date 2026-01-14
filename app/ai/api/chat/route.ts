@@ -10,35 +10,25 @@ type ChatBody = {
   debug?: boolean;
 };
 
-type Compat = {
-  family?: string;   // NVR/DVR/XVR/CAMERA/SWITCH/AJAX/KIT/OTHER
-  tech?: string;     // IP/COAX/RADIO/OTHER
-  poe?: boolean;
-  channels?: number | null;
-  poe_ports?: number | null;
-  storage_bays?: number | null;
-  cable?: string | null; // RJ45/KX6
-  power?: string | null; // POE/12V/230V/BATTERY
-  onvif?: boolean | null;
-  max_mp?: number | null;
-};
-
 type Candidate = {
   id: number;
   name: string | null;
   url: string | null;
-  price: number | null; // HT
+  price: number | null; // HT (en base)
   currency: string | null;
   product_type: string | null;
   sku: string | null;
-  fiche_technique_url: string | null;
-  payload: any;
+  fiche_technique_url?: string | null;
 
-  compat: Compat;
+  // classification
+  isRecorder: boolean;
+  isCamera: boolean;
+  isIP: boolean;
+  isPoE: boolean;
+  channels: number | null;
 
-  // derived
-  final_price_ht: number | null;
-  final_price_ttc: number | null;
+  // debug
+  score?: number;
 };
 
 function clampInt(v: any, def: number, min: number, max: number) {
@@ -47,113 +37,148 @@ function clampInt(v: any, def: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.trunc(n)));
 }
 
-function normLower(s: any): string {
-  if (s === null || s === undefined) return "";
-  return String(s).toLowerCase().trim();
+function extractChannels(text: string): number | null {
+  if (!text) return null;
+  const m1 = text.match(/(\d{1,2})\s*(canaux|ch|voies)\b/i);
+  if (m1) return Number(m1[1]);
+  return null;
 }
 
-function extractChannelsFromText(text: string): number | null {
-  const t = normLower(text);
-  const m = t.match(/(\d{1,2})\s*(canaux|ch|voies)\b/);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? n : null;
+function priceTTC(priceHT: number | null, tva = 0.2): number | null {
+  if (typeof priceHT !== "number") return null;
+  // arrondi à 2 décimales
+  return Math.round(priceHT * (1 + tva) * 100) / 100;
 }
 
-// ---------- NEED DETECTION ----------
 function detectNeed(input: string) {
-  const t = normLower(input);
+  const t = (input || "").toLowerCase();
 
-  const wantsRecorder = t.includes("enregistreur") || t.includes("nvr") || t.includes("dvr") || t.includes("xvr");
-  const wantsCamera = t.includes("caméra") || t.includes("camera");
-  const wantsSwitch = t.includes("switch");
-  const wantsAjax = t.includes("ajax");
+  const wantsRecorder =
+    t.includes("enregistreur") || t.includes("nvr") || t.includes("dvr") || t.includes("xvr");
 
-  const wantsIP = t.includes("ip") || t.includes("réseau") || t.includes("reseau") || t.includes("nvr");
-  const wantsCoax = t.includes("coax") || t.includes("tvi") || t.includes("cvi") || t.includes("ahd") || t.includes("dvr") || t.includes("xvr");
+  const wantsCamera =
+    t.includes("caméra") || t.includes("camera") || t.includes("caméras") || t.includes("cameras");
+
+  // IP peut concerner caméra et/ou enregistreur
+  const wantsIP = t.includes("ip") || t.includes("nvr");
   const wantsPoE = t.includes("poe");
 
   const m = t.match(/(\d{1,2})\s*(cam(é|e)ras?|camera|canaux|ch|voies)\b/i);
-  const requestedChannels = m ? Number(m[1]) : null;
+  const channels = m ? Number(m[1]) : null;
 
   return {
     wantsRecorder,
     wantsCamera,
-    wantsSwitch,
-    wantsAjax,
     wantsIP,
-    wantsCoax,
     wantsPoE,
-    requestedChannels: requestedChannels && requestedChannels > 0 ? requestedChannels : null,
+    requestedChannels: channels && channels > 0 ? channels : null,
   };
 }
 
-// ---------- PICKER ----------
-function pickBest(candidates: Candidate[], requestedChannels: number | null) {
-  if (!candidates.length) return { exact: null as Candidate | null, fallback: null as Candidate | null };
+function tokenize(input: string): string[] {
+  return (input || "")
+    .toLowerCase()
+    .replace(/[’'"]/g, " ")
+    .replace(/[^a-z0-9àâäéèêëîïôöùûüç\s-]/g, " ")
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 30);
+}
 
-  if (!requestedChannels) {
-    // plus petit nombre de canaux non-null, sinon 1er
-    const sorted = [...candidates].sort((a, b) => {
-      const ca = typeof a.compat.channels === "number" ? a.compat.channels : 9999;
-      const cb = typeof b.compat.channels === "number" ? b.compat.channels : 9999;
-      return ca - cb;
-    });
-    return { exact: sorted[0] ?? null, fallback: null };
+function buildHaystack(r: any): string {
+  const parts: string[] = [];
+  const name = (r?.name || r?.payload?.name || "").toString();
+  parts.push(name);
+
+  const sku = (r?.sku || r?.payload?.["product-reference"] || r?.payload?.["code-fabricant"] || "").toString();
+  parts.push(sku);
+
+  const productType = (r?.product_type || r?.payload?.["type-de-produit"] || "").toString();
+  parts.push(productType);
+
+  const altword = (r?.payload?.altword || "").toString();
+  parts.push(altword);
+
+  const descMini = (r?.payload?.["description-mini"] || "").toString();
+  parts.push(descMini);
+
+  const desc = (r?.payload?.description || "").toString();
+  parts.push(desc);
+
+  return parts.join(" ").toLowerCase();
+}
+
+function classifyCandidate(hay: string, name: string) {
+  const isRecorder =
+    hay.includes("enregistreur") || hay.includes("nvr") || hay.includes("dvr") || hay.includes("xvr");
+
+  const isCamera =
+    hay.includes("caméra") || hay.includes("camera") || hay.includes("dôme") || hay.includes("dome") || hay.includes("bullet") || hay.includes("tubulaire");
+
+  const isIP = hay.includes("ip") || hay.includes("nvr") || hay.includes("onvif") || hay.includes("rtsp");
+  const isPoE = hay.includes("poe") || hay.includes("802.3af") || hay.includes("802.3at");
+
+  const channels = extractChannels(name);
+
+  return { isRecorder, isCamera, isIP, isPoE, channels };
+}
+
+function scoreCandidate(tokens: string[], hay: string) {
+  // scoring simple: +2 par token exact présent, +5 si token ressemble à une ref (contient - ou / ou chiffres)
+  let score = 0;
+
+  for (const tok of tokens) {
+    if (!tok) continue;
+    if (hay.includes(tok)) score += 2;
+
+    // bonus “référence”
+    const looksLikeRef = /[0-9]/.test(tok) && (tok.includes("-") || tok.includes("/") || tok.length >= 6);
+    if (looksLikeRef && hay.includes(tok)) score += 5;
   }
 
-  const exact = candidates.find((c) => c.compat.channels === requestedChannels) ?? null;
+  // petits bonus business
+  if (hay.includes("poe")) score += 1;
+  if (hay.includes("ip")) score += 1;
+
+  return score;
+}
+
+function pickRecorder(cands: Candidate[], requestedChannels: number | null) {
+  if (!cands.length) return { exact: null as Candidate | null, fallback: null as Candidate | null };
+
+  // On trie d’abord par score desc, puis par canaux asc (pour prendre le plus petit qui convient)
+  const sorted = [...cands].sort((a, b) => {
+    const sa = a.score ?? 0;
+    const sb = b.score ?? 0;
+    if (sb !== sa) return sb - sa;
+    const ca = a.channels ?? 9999;
+    const cb = b.channels ?? 9999;
+    return ca - cb;
+  });
+
+  if (!requestedChannels) return { exact: sorted[0] ?? null, fallback: null };
+
+  const exact = sorted.find((c) => c.channels === requestedChannels) ?? null;
   if (exact) return { exact, fallback: null };
 
-  const higher = candidates
-    .filter((c) => typeof c.compat.channels === "number" && (c.compat.channels as number) > requestedChannels)
-    .sort((a, b) => (a.compat.channels as number) - (b.compat.channels as number));
+  const higher = sorted
+    .filter((c) => typeof c.channels === "number" && (c.channels as number) > requestedChannels)
+    .sort((a, b) => (a.channels as number) - (b.channels as number));
 
   return { exact: null, fallback: higher[0] ?? null };
 }
 
-function formatMoneyEUR(v: number) {
-  // format FR simple
-  return v.toFixed(2).replace(".", ",");
+function pickCameras(cands: Candidate[], max = 3) {
+  const sorted = [...cands].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  return sorted.slice(0, max);
 }
 
-function addTTC(ht: number | null, vat = 0.2) {
-  if (typeof ht !== "number") return null;
-  return Math.round(ht * (1 + vat) * 100) / 100;
-}
-
-function buildCandidate(r: any, minVarPrice: number | null): Candidate {
-  const pid = Number(r.id);
-  const name = (r.name || r.payload?.name || "").toString() || null;
-
-  // compat (depuis sync)
-  const compat: Compat = (r.payload?.compat || {}) as Compat;
-
-  // fallback channels si compat pas remplie
-  if (compat.channels === undefined || compat.channels === null) {
-    compat.channels = extractChannelsFromText(name || "");
-  }
-
-  // prix final HT : products.price sinon min variante
-  const final_price_ht =
-    typeof r.price === "number" ? r.price : (typeof minVarPrice === "number" ? minVarPrice : null);
-
-  const final_price_ttc = addTTC(final_price_ht);
-
-  return {
-    id: Number.isFinite(pid) ? pid : 0,
-    name,
-    url: (r.url || null) as string | null,
-    price: typeof r.price === "number" ? r.price : null,
-    currency: (r.currency || "EUR") as string | null,
-    product_type: (r.product_type || null) as string | null,
-    sku: (r.sku || null) as string | null,
-    fiche_technique_url: (r.fiche_technique_url || null) as string | null,
-    payload: r.payload || {},
-    compat,
-    final_price_ht,
-    final_price_ttc,
-  };
+function safeLinkLabel(name: string | null, sku: string | null) {
+  const n = (name || "").trim();
+  const s = (sku || "").trim();
+  if (n && s) return `${n} — ${s}`;
+  return n || s || "Voir produit";
 }
 
 export async function POST(req: Request) {
@@ -168,125 +193,166 @@ export async function POST(req: Request) {
 
     const supa = supabaseAdmin();
 
-    // 1) Load products (on prend payload + fiche tech)
+    // 1) Load products
     const { data: raw, error } = await supa
       .from("products")
       .select("id,name,url,price,currency,product_type,sku,fiche_technique_url,payload")
-      .limit(500);
+      .limit(1000);
 
     if (error) {
       return Response.json({ ok: false, error: "Supabase query failed", details: error.message }, { status: 500 });
     }
 
     const rows = Array.isArray(raw) ? raw : [];
-    const productIds = rows.map((r: any) => Number(r.id)).filter((n) => Number.isFinite(n));
+    const tokens = tokenize(input);
 
-    // 2) min price per product from variants
-    const minPriceByProductId = new Map<number, number>();
-    if (productIds.length) {
-      const { data: vars, error: vErr } = await supa
-        .from("product_variants")
-        .select("product_id,price")
-        .in("product_id", productIds);
+    // 2) Build candidates with classification + scoring
+    const all: Candidate[] = rows
+      .map((r: any) => {
+        const pid = Number(r.id);
+        if (!Number.isFinite(pid)) return null;
 
-      if (!vErr && Array.isArray(vars)) {
-        for (const v of vars as any[]) {
-          const pid = Number(v.product_id);
-          const p = typeof v.price === "number" ? v.price : null;
-          if (!Number.isFinite(pid) || p === null) continue;
+        const name = (r.name || r.payload?.name || "").toString() || null;
+        const url = (r.url || null) as string | null;
+        const sku = (r.sku || r.payload?.["product-reference"] || r.payload?.["code-fabricant"] || null) as string | null;
+        const product_type = (r.product_type || r.payload?.["type-de-produit"] || null) as string | null;
 
-          const prev = minPriceByProductId.get(pid);
-          if (prev === undefined || p < prev) minPriceByProductId.set(pid, p);
-        }
-      }
+        const hay = buildHaystack(r);
+        const cls = classifyCandidate(hay, name || "");
+
+        const score = scoreCandidate(tokens, hay);
+
+        return {
+          id: pid,
+          name,
+          url,
+          price: typeof r.price === "number" ? r.price : null,
+          currency: (r.currency || "EUR") as string | null,
+          product_type,
+          sku,
+          fiche_technique_url: (r.fiche_technique_url || null) as string | null,
+
+          isRecorder: cls.isRecorder,
+          isCamera: cls.isCamera,
+          isIP: cls.isIP,
+          isPoE: cls.isPoE,
+          channels: cls.channels,
+
+          score,
+        } as Candidate;
+      })
+      .filter(Boolean) as Candidate[];
+
+    // 3) Split: recorders & cameras
+    let recorders = all.filter((c) => c.isRecorder);
+    let cameras = all.filter((c) => c.isCamera);
+
+    // Filtre IP/PoE si demandé
+    if (need.wantsIP) {
+      // si demande IP, on privilégie IP (mais on garde une fallback plus bas)
+      recorders = recorders.filter((c) => c.isIP);
+      cameras = cameras.filter((c) => c.isIP);
+    }
+    if (need.wantsPoE) {
+      recorders = recorders.filter((c) => c.isPoE);
+      cameras = cameras.filter((c) => c.isPoE || c.isIP); // caméras IP PoE souvent marquées IP; on évite de vider à tort
     }
 
-    // 3) Build candidates
-    const candidatesAll: Candidate[] = rows.map((r: any) => {
-      const pid = Number(r.id);
-      const minVar = minPriceByProductId.get(pid) ?? null;
-      return buildCandidate(r, minVar);
-    });
+    // fallback si trop strict => on relâche progressivement
+    if (!recorders.length) recorders = all.filter((c) => c.isRecorder);
+    if (!cameras.length) cameras = all.filter((c) => c.isCamera);
 
-    // 4) Filter based on need (v1: on part sur “enregistreur” sinon on étendra)
-    // On garde volontairement simple pour commencer caméra/enregistreur.
-    let candidates = candidatesAll;
+    const pickedRecorder = need.wantsRecorder ? pickRecorder(recorders, need.requestedChannels) : { exact: null, fallback: null };
+    const chosenRecorder = pickedRecorder.exact || pickedRecorder.fallback;
 
-    if (need.wantsAjax) {
-      candidates = candidates.filter((c) => normLower(c.compat.family) === "ajax" || normLower(c.payload?.raccordement) === "radio");
-    } else if (need.wantsRecorder) {
-      candidates = candidates.filter((c) => {
-        const fam = normLower(c.compat.family);
-        return fam === "nvr" || fam === "dvr" || fam === "xvr";
+    const chosenCameras = need.wantsCamera ? pickCameras(cameras, 3) : [];
+
+    // 4) Build rag sources (urls only, no hallucination)
+    const sources: { id: number; url: string | null }[] = [];
+    for (const c of [chosenRecorder, ...chosenCameras].filter(Boolean) as Candidate[]) {
+      sources.push({ id: c.id, url: c.url || null });
+    }
+
+    // 5) If nothing found => polite answer (no invention)
+    if (!chosenRecorder && chosenCameras.length === 0) {
+      const reply = await chatCompletion([
+        { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
+        {
+          role: "system" as const,
+          content:
+            `RÈGLE: si aucun produit n'est trouvé, tu l'annonces clairement et tu poses 2-3 questions. ` +
+            `Interdiction d'inventer une URL, un prix ou un produit.`,
+        },
+        { role: "user" as const, content: input },
+      ]);
+
+      return Response.json({
+        ok: true,
+        conversationId,
+        reply,
+        rag: { used: 0, sources: [] },
+        ...(debug ? { debug: { need, candidatesCount: all.length } } : {}),
       });
-    } else if (need.wantsCamera) {
-      candidates = candidates.filter((c) => normLower(c.compat.family) === "camera");
-    } else if (need.wantsSwitch) {
-      candidates = candidates.filter((c) => normLower(c.compat.family) === "switch");
     }
 
-    // refine tech/poe
-    if (need.wantsIP) candidates = candidates.filter((c) => normLower(c.compat.tech) === "ip" || normLower(c.compat.family) === "nvr");
-    if (need.wantsCoax) candidates = candidates.filter((c) => normLower(c.compat.tech) === "coax" || normLower(c.compat.family) === "dvr" || normLower(c.compat.family) === "xvr");
-    if (need.wantsPoE) candidates = candidates.filter((c) => !!c.compat.poe);
+    // 6) Format blocks for the model (strictly from DB)
+    const TVA = 0.2;
 
-    // fallback if empty (avoid "no results" too often)
-    if (!candidates.length && need.wantsRecorder) {
-      candidates = candidatesAll.filter((c) => {
-        const fam = normLower(c.compat.family);
-        return fam === "nvr" || fam === "dvr" || fam === "xvr";
-      });
-    }
+    const formatProductBlock = (c: Candidate) => {
+      const ttc = priceTTC(c.price, TVA);
+      const priceLine = ttc !== null ? `${ttc.toFixed(2)} ${(c.currency || "EUR")}` : "Voir page produit";
+      const linkLine = c.url ? c.url : "N/A";
+      const ftLine = c.fiche_technique_url ? c.fiche_technique_url : "N/A";
 
-    const picked = pickBest(candidates, need.requestedChannels);
-    const ragSources = candidates.slice(0, 6).map((c) => ({ id: c.id, url: c.url }));
+      return [
+        `ID: ${c.id}`,
+        `Nom: ${c.name || "N/A"}`,
+        `SKU: ${c.sku || "N/A"}`,
+        `Type: ${c.product_type || "N/A"}`,
+        `Canaux: ${c.channels ?? "N/A"}`,
+        `IP: ${c.isIP ? "oui" : "non"}`,
+        `PoE: ${c.isPoE ? "oui" : "non"}`,
+        `Prix TTC: ${priceLine}`,
+        `URL EXACTE: ${linkLine}`,
+        `FICHE TECHNIQUE: ${ftLine}`,
+      ].join("\n");
+    };
 
-    const chosen = picked.exact || picked.fallback;
-
-    // ---------- Prompt policy ----------
     const policy = `
-RÈGLES DE RÉPONSE:
-- Si produit exact => titre "✅ Produit recommandé"
-- Si pas exact => titre "ℹ️ Alternative proposée" ET phrase explicite: "Nous n’avons pas de X canaux..., voici l’alternative Y canaux."
-- Affiche TOUJOURS : Nom, Canaux, PoE, Prix TTC, Lien.
-- Prix TTC = HT * 1.20 (TVA 20%).
-- Si fiche_technique_url existe => ajouter une ligne "📄 Fiche technique : <lien>"
-- N’invente jamais d’URL. Utilise uniquement l’URL fournie.
-- Après la reco : poser des questions utiles, groupées (compatibilité / stockage / objectif), pas en liste brute "1/2/3" si possible.
+FORMAT DE RÉPONSE (E-COMMERCE):
+- Réponds en français, ton pro.
+- Ne JAMAIS inventer un lien, un prix, une fiche technique.
+- Utilise UNIQUEMENT les champs "URL EXACTE" et "FICHE TECHNIQUE" fournis.
+- Si la demande contient "caméras" + "enregistreur": propose 1 enregistreur + 2 à 3 caméras (si dispo).
+- Prix: toujours en TTC (TVA 20% déjà appliquée dans "Prix TTC").
+- Si l'utilisateur demande X canaux et que tu proposes plus: dis explicitement "Nous n’avons pas X canaux, meilleure alternative = Y canaux".
+- Pas de liste brute "1/2/3" trop sèche.
+  => Termine par 2-3 questions utiles regroupées (compatibilité caméras, HDD + jours d'archives, résolution/budget).
+- La fiche technique est un lien: tu peux la proposer en une ligne courte ("📄 Fiche technique: ...") sans redire "consultez".
 `.trim();
 
     const needSummary = `
-BESOIN CLIENT (déduit):
-- cherche enregistreur: ${need.wantsRecorder ? "oui" : "non"}
+BESOIN CLIENT:
+- Caméras demandées: ${need.wantsCamera ? "oui" : "non"}
+- Enregistreur demandé: ${need.wantsRecorder ? "oui" : "non"}
 - IP: ${need.wantsIP ? "oui" : "non"}
-- COAX: ${need.wantsCoax ? "oui" : "non"}
 - PoE: ${need.wantsPoE ? "oui" : "non"}
 - Canaux demandés: ${need.requestedChannels ?? "non précisé"}
 `.trim();
 
-    const formatChosen = (c: Candidate) => {
-      const priceTtc = typeof c.final_price_ttc === "number" ? `${formatMoneyEUR(c.final_price_ttc)} € TTC` : "voir page produit";
-      const ft = c.fiche_technique_url ? `📄 Fiche technique : ${c.fiche_technique_url}` : "";
-      return [
-        `Nom : ${c.name || "N/A"}`,
-        `Canaux : ${typeof c.compat.channels === "number" ? c.compat.channels : "N/A"}`,
-        `PoE : ${c.compat.poe ? "oui" : "non"}`,
-        `Prix TTC : ${priceTtc}`,
-        `Lien : ${c.url || "N/A"}`,
-        ft ? ft : null,
-      ].filter(Boolean).join("\n");
-    };
+    const blocks: string[] = [];
+    if (chosenRecorder) {
+      const label = pickedRecorder.exact ? "PRODUIT EXACT (ENREGISTREUR)" : "ALTERNATIVE (ENREGISTREUR)";
+      blocks.push(`[${label}]\n${formatProductBlock(chosenRecorder)}\n`);
+    }
+    if (chosenCameras.length) {
+      blocks.push(
+        `[CAMÉRAS SUGGÉRÉES]\n` +
+          chosenCameras.map((c, i) => `--- Caméra ${i + 1} ---\n${formatProductBlock(c)}`).join("\n\n")
+      );
+    }
 
-    const exactBlock = picked.exact ? `\n[PRODUIT EXACT]\n${formatChosen(picked.exact)}\n` : "";
-    const fallbackBlock = picked.fallback ? `\n[PRODUIT ALTERNATIF]\n${formatChosen(picked.fallback)}\n` : "";
-
-    const context = `
-${policy}
-
-${needSummary}
-${exactBlock}
-${fallbackBlock}
-`.trim();
+    const context = `${policy}\n\n${needSummary}\n\n${blocks.join("\n")}`.trim();
 
     const messages = [
       { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
@@ -300,23 +366,27 @@ ${fallbackBlock}
       ok: true,
       conversationId,
       reply,
-      rag: { used: chosen ? 1 : 0, sources: ragSources },
+      rag: { used: sources.length ? 1 : 0, sources },
       ...(debug
         ? {
             debug: {
               need,
               picked: {
-                exact: picked.exact ? { id: picked.exact.id, url: picked.exact.url, compat: picked.exact.compat, ttc: picked.exact.final_price_ttc } : null,
-                fallback: picked.fallback ? { id: picked.fallback.id, url: picked.fallback.url, compat: picked.fallback.compat, ttc: picked.fallback.final_price_ttc } : null,
+                recorder: chosenRecorder
+                  ? { id: chosenRecorder.id, url: chosenRecorder.url, channels: chosenRecorder.channels, price_ttc: priceTTC(chosenRecorder.price, 0.2) }
+                  : null,
+                cameras: chosenCameras.map((c) => ({ id: c.id, url: c.url })),
               },
-              candidates: candidates.slice(0, 6).map((c) => ({
-                id: c.id,
-                name: c.name,
-                url: c.url,
-                compat: c.compat,
-                ttc: c.final_price_ttc,
-                fiche_technique_url: c.fiche_technique_url,
-              })),
+              candidates: {
+                recordersTop: recorders
+                  .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+                  .slice(0, 6)
+                  .map((c) => ({ id: c.id, name: c.name, url: c.url, score: c.score })),
+                camerasTop: cameras
+                  .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+                  .slice(0, 6)
+                  .map((c) => ({ id: c.id, name: c.name, url: c.url, score: c.score })),
+              },
             },
           }
         : {}),
