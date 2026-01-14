@@ -6,10 +6,8 @@ import { cookies } from "next/headers";
 export const runtime = "nodejs";
 
 type ChatBody = {
-  input: string;
+  input?: string;
   debug?: boolean;
-
-  // optionnel : pour actions
   action?: "reset" | "close" | "reopen";
 };
 
@@ -20,8 +18,7 @@ type Candidate = {
   price_ht: number | null;
   currency: string | null;
 
-  product_type: string | null;
-  product_kind: string | null; // si tu l'as; sinon null
+  product_type: string | null; // si tu l’as, sinon null
   brand: string | null;
   sku: string | null;
   fiche_technique_url: string | null;
@@ -111,19 +108,21 @@ function buildHaystack(r: any): string {
   const parts: string[] = [];
   parts.push((r?.name || p?.name || "").toString());
   parts.push((r?.sku || p?.["product-reference"] || p?.["code-fabricant"] || "").toString());
-  parts.push((r?.product_type || p?.["type-de-produit"] || "").toString());
-  parts.push((r?.product_kind || "").toString());
+  parts.push((r?.product_type || "").toString());
   parts.push((r?.brand || p?.fabricant || p?.fabricants || "").toString());
   parts.push((p?.altword || "").toString());
   parts.push((p?.["description-mini"] || "").toString());
   parts.push((p?.description || "").toString());
-  // slug parfois dans payload
   parts.push((p?.slug || "").toString());
   return parts.join(" ").toLowerCase();
 }
 
 function detectIPPoE(hay: string) {
-  const isPoE = hay.includes("poe") || hay.includes("802.3af") || hay.includes("802.3at") || hay.includes("802.3bt");
+  const isPoE =
+    hay.includes("poe") ||
+    hay.includes("802.3af") ||
+    hay.includes("802.3at") ||
+    hay.includes("802.3bt");
   const isIP = hay.includes("ip") || hay.includes("onvif") || hay.includes("rtsp") || hay.includes("nvr");
   return { isIP, isPoE };
 }
@@ -143,25 +142,17 @@ function scoreCandidate(tokens: string[], hay: string) {
 
 function isAjaxProduct(c: Candidate) {
   const hay = buildHaystack(c);
-  // On exclut TOUT Ajax : brand / slug / mots clés
   return hay.includes("ajax") || hay.includes("jeweller") || hay.includes("fibra");
 }
 
 function isRecorder(c: Candidate) {
   const hay = buildHaystack(c);
-  return (
-    c.product_kind === "recorder" ||
-    hay.includes("enregistreur") ||
-    hay.includes("nvr") ||
-    hay.includes("dvr") ||
-    hay.includes("xvr")
-  );
+  return hay.includes("enregistreur") || hay.includes("nvr") || hay.includes("dvr") || hay.includes("xvr");
 }
 
 function isCamera(c: Candidate) {
   const hay = buildHaystack(c);
   return (
-    c.product_kind === "camera" ||
     hay.includes("caméra") ||
     hay.includes("camera") ||
     hay.includes("dome") ||
@@ -219,12 +210,11 @@ function benefitShort(c: Candidate) {
   const b = c.payload?.benefice_court || c.payload?.["benefice-court"];
   if (typeof b === "string" && b.trim()) return b.trim();
   if (isRecorder(c)) return "Enregistrement fiable et accès à distance.";
-  if (isCamera(c)) return "Surveillance IP, image nette, vision nuit selon modèle.";
+  if (isCamera(c)) return "Image nette et vision nocturne selon modèle.";
   return "Produit adapté à la vidéosurveillance.";
 }
 
 async function ensureConversation(supa: ReturnType<typeof supabaseAdmin>, id: string, scope: string) {
-  // crée si absent
   await supa.from("conversations").upsert(
     { id, scope, updated_at: new Date().toISOString() },
     { onConflict: "id" }
@@ -255,13 +245,10 @@ export async function POST(req: Request) {
     const jar = await cookies();
     let conversationId = jar.get(COOKIE_NAME)?.value || null;
 
-    // action reset / close / reopen (sans input obligatoire)
     const action = body?.action;
-
     const supa = supabaseAdmin();
 
     if (action === "reset") {
-      // nouvelle conv
       conversationId = crypto.randomUUID();
       jar.set(COOKIE_NAME, conversationId, { httpOnly: true, sameSite: "lax", path: "/" });
       await ensureConversation(supa, conversationId, "general");
@@ -288,36 +275,29 @@ export async function POST(req: Request) {
     const scope = isVideoScope(input) ? "video" : "general";
     await ensureConversation(supa, conversationId, scope);
 
-    // log user message
     await addMessage(supa, conversationId, "user", input);
 
-    // pinned recorder?
     let pinnedRecorderId: number | null = null;
-    try {
-      const { data: conv } = await supa
-        .from("conversations")
-        .select("picked_recorder_id,closed_at,scope")
-        .eq("id", conversationId)
-        .maybeSingle();
+    const { data: conv } = await supa
+      .from("conversations")
+      .select("picked_recorder_id,closed_at,scope")
+      .eq("id", conversationId)
+      .maybeSingle();
 
-      if (conv?.closed_at) {
-        return Response.json(
-          { ok: false, error: "Conversation closed", details: "Send action=reopen or action=reset" },
-          { status: 409 }
-        );
-      }
-
-      if (conv?.picked_recorder_id) pinnedRecorderId = Number(conv.picked_recorder_id) || null;
-    } catch {
-      // non bloquant
+    if (conv?.closed_at) {
+      return Response.json(
+        { ok: false, error: "Conversation closed", details: "Send action=reopen or action=reset" },
+        { status: 409 }
+      );
     }
+    if (conv?.picked_recorder_id) pinnedRecorderId = Number(conv.picked_recorder_id) || null;
 
     const need = detectNeed(input);
 
-    // load catalogue
+    // ✅ IMPORTANT : on ne sélectionne plus product_kind
     const { data: raw, error } = await supa
       .from("products")
-      .select("id,name,url,price,currency,product_type,product_kind,brand,sku,fiche_technique_url,payload")
+      .select("id,name,url,price,currency,product_type,brand,sku,fiche_technique_url,payload")
       .limit(3000);
 
     if (error) {
@@ -337,7 +317,8 @@ export async function POST(req: Request) {
         const { isIP, isPoE } = detectIPPoE(hay);
 
         const name = (r.name || r.payload?.name || "").toString().trim() || null;
-        const sku = (r.sku || r.payload?.["product-reference"] || r.payload?.["code-fabricant"] || "").toString().trim() || null;
+        const sku =
+          (r.sku || r.payload?.["product-reference"] || r.payload?.["code-fabricant"] || "").toString().trim() || null;
         const brand = (r.brand || r.payload?.fabricant || r.payload?.fabricants || "").toString().trim() || null;
 
         return {
@@ -347,7 +328,6 @@ export async function POST(req: Request) {
           price_ht: typeof r.price === "number" ? r.price : null,
           currency: (r.currency || "EUR") as string | null,
           product_type: (r.product_type || null) as string | null,
-          product_kind: (r.product_kind || null) as string | null,
           brand,
           sku,
           fiche_technique_url: (r.fiche_technique_url || null) as string | null,
@@ -360,24 +340,22 @@ export async function POST(req: Request) {
       })
       .filter(Boolean) as Candidate[];
 
-    // ✅ EXCLUSION AJAX : si scope video => on sort TOUT ajax
-    if (scope === "video") {
-      all = all.filter((c) => !isAjaxProduct(c));
-    }
+    // ✅ EXCLUSION AJAX automatique en scope video
+    if (scope === "video") all = all.filter((c) => !isAjaxProduct(c));
 
     let recorders = all.filter(isRecorder);
     let cameras = all.filter(isCamera);
 
-    // filtres IP/PoE
     if (need.wantsIP) {
       recorders = recorders.filter((c) => c.isIP);
       cameras = cameras.filter((c) => c.isIP);
     }
     if (need.wantsPoE) {
+      // caméras PoE ou IP (certaines fiches ne mentionnent pas PoE explicitement)
       cameras = cameras.filter((c) => c.isPoE || c.isIP);
     }
 
-    // pick recorder
+    // Recorder choisi
     let chosenRecorder: Candidate | null = null;
     let pickedMode: "pinned" | "exact" | "fallback" | "none" = "none";
 
@@ -392,7 +370,6 @@ export async function POST(req: Request) {
       pickedMode = picked.exact ? "exact" : picked.fallback ? "fallback" : "none";
     }
 
-    // persist pinned recorder
     if (chosenRecorder) {
       await supa
         .from("conversations")
@@ -400,10 +377,8 @@ export async function POST(req: Request) {
         .eq("id", conversationId);
     }
 
-    // pick cameras (si demandées)
     const chosenCameras = need.wantsCamera ? pickCameras(cameras, 3) : [];
 
-    // context strict
     const recorderBlock = chosenRecorder
       ? `RECORDER:
 LABEL: ${commercialLabel(chosenRecorder)}
@@ -444,7 +419,7 @@ RÈGLES ABSOLUES:
 - Style commercial: "Nom + Référence + de chez Marque" + prix TTC.
 - Si canaux demandés non dispo: l'indiquer clairement et proposer la meilleure alternative.
 - Caméras: 3 propositions, triées prix croissant, chacune avec LABEL, PRICE_TTC, URL, FT, BENEFIT.
-- Finir par 3 questions GROUPÉES (caméras existantes / jours d’archive & HDD / résolution & budget).
+- Finir par 3 questions groupées (caméras existantes / jours d’archive & HDD / résolution & budget).
 - Contexte "video": interdiction de proposer Ajax.
 `.trim();
 
@@ -468,7 +443,6 @@ scope=${scope}
 
     const reply = await chatCompletion(messages);
 
-    // log assistant message (avec meta utile)
     await addMessage(supa, conversationId, "assistant", reply, {
       scope,
       pickedMode,
@@ -493,7 +467,9 @@ scope=${scope}
               pickedMode,
               pinnedRecorderId,
               picked: {
-                recorder: chosenRecorder ? { id: chosenRecorder.id, url: chosenRecorder.url, label: commercialLabel(chosenRecorder) } : null,
+                recorder: chosenRecorder
+                  ? { id: chosenRecorder.id, url: chosenRecorder.url, label: commercialLabel(chosenRecorder) }
+                  : null,
                 cameras: chosenCameras.map((c) => ({ id: c.id, url: c.url, label: commercialLabel(c) })),
               },
               counts: { all: all.length, recorders: recorders.length, cameras: cameras.length },
