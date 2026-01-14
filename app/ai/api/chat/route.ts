@@ -1,13 +1,16 @@
 // app/ai/api/chat/route.ts
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 import { chatCompletion, CAMPROTECT_SYSTEM_PROMPT } from "@/lib/openai";
+import { cookies } from "next/headers";
 
 export const runtime = "nodejs";
 
 type ChatBody = {
   input: string;
-  conversationId?: string;
   debug?: boolean;
+
+  // optionnel : pour actions
+  action?: "reset" | "close" | "reopen";
 };
 
 type Candidate = {
@@ -16,8 +19,9 @@ type Candidate = {
   url: string | null;
   price_ht: number | null;
   currency: string | null;
+
   product_type: string | null;
-  product_kind: string | null; // 'camera' | 'recorder' | 'switch' | 'alarm' | ...
+  product_kind: string | null; // si tu l'as; sinon null
   brand: string | null;
   sku: string | null;
   fiche_technique_url: string | null;
@@ -30,14 +34,13 @@ type Candidate = {
 };
 
 const TVA = 0.2;
+const COOKIE_NAME = "cp_conv_id";
 
 function priceTTC(ht: number | null): number | null {
   if (typeof ht !== "number") return null;
   return Math.round(ht * (1 + TVA) * 100) / 100;
 }
-
 function fmtEuro(n: number) {
-  // affichage simple "166,45"
   return n.toFixed(2).replace(".", ",");
 }
 
@@ -58,11 +61,31 @@ function tokenize(input: string): string[] {
     .slice(0, 30);
 }
 
+function isVideoScope(input: string) {
+  const t = (input || "").toLowerCase();
+  return (
+    t.includes("caméra") ||
+    t.includes("camera") ||
+    t.includes("caméras") ||
+    t.includes("cameras") ||
+    t.includes("enregistreur") ||
+    t.includes("nvr") ||
+    t.includes("dvr") ||
+    t.includes("xvr") ||
+    t.includes("poe") ||
+    t.includes("onvif") ||
+    t.includes("rtsp") ||
+    t.includes("ip ")
+  );
+}
+
 function detectNeed(input: string) {
   const t = (input || "").toLowerCase();
 
-  const wantsRecorder = t.includes("enregistreur") || t.includes("nvr") || t.includes("dvr") || t.includes("xvr");
-  const wantsCamera = t.includes("caméra") || t.includes("camera") || t.includes("caméras") || t.includes("cameras");
+  const wantsRecorder =
+    t.includes("enregistreur") || t.includes("nvr") || t.includes("dvr") || t.includes("xvr");
+  const wantsCamera =
+    t.includes("caméra") || t.includes("camera") || t.includes("caméras") || t.includes("cameras");
 
   const wantsIP = t.includes("ip") || t.includes("nvr");
   const wantsPoE = t.includes("poe");
@@ -94,6 +117,8 @@ function buildHaystack(r: any): string {
   parts.push((p?.altword || "").toString());
   parts.push((p?.["description-mini"] || "").toString());
   parts.push((p?.description || "").toString());
+  // slug parfois dans payload
+  parts.push((p?.slug || "").toString());
   return parts.join(" ").toLowerCase();
 }
 
@@ -108,7 +133,6 @@ function scoreCandidate(tokens: string[], hay: string) {
   for (const tok of tokens) {
     if (!tok) continue;
     if (hay.includes(tok)) score += 2;
-
     const looksLikeRef = /[0-9]/.test(tok) && (tok.includes("-") || tok.includes("/") || tok.length >= 6);
     if (looksLikeRef && hay.includes(tok)) score += 6;
   }
@@ -117,25 +141,33 @@ function scoreCandidate(tokens: string[], hay: string) {
   return score;
 }
 
+function isAjaxProduct(c: Candidate) {
+  const hay = buildHaystack(c);
+  // On exclut TOUT Ajax : brand / slug / mots clés
+  return hay.includes("ajax") || hay.includes("jeweller") || hay.includes("fibra");
+}
+
 function isRecorder(c: Candidate) {
   const hay = buildHaystack(c);
-  return c.product_kind === "recorder" || hay.includes("enregistreur") || hay.includes("nvr") || hay.includes("dvr") || hay.includes("xvr");
+  return (
+    c.product_kind === "recorder" ||
+    hay.includes("enregistreur") ||
+    hay.includes("nvr") ||
+    hay.includes("dvr") ||
+    hay.includes("xvr")
+  );
 }
 
 function isCamera(c: Candidate) {
   const hay = buildHaystack(c);
-  return c.product_kind === "camera" || hay.includes("caméra") || hay.includes("camera") || hay.includes("dome") || hay.includes("bullet") || hay.includes("tubulaire");
-}
-
-function excludeNonIPCameras(c: Candidate, need: ReturnType<typeof detectNeed>) {
-  // Si user veut des caméras IP, on exclut Ajax MotionCam / alarm / détecteurs
-  if (!need.wantsIP) return true;
-
-  const hay = buildHaystack(c);
-  if (c.product_kind === "alarm") return false;
-  if (hay.includes("ajax") || hay.includes("motioncam") || hay.includes("jeweller")) return false;
-
-  return true;
+  return (
+    c.product_kind === "camera" ||
+    hay.includes("caméra") ||
+    hay.includes("camera") ||
+    hay.includes("dome") ||
+    hay.includes("bullet") ||
+    hay.includes("tubulaire")
+  );
 }
 
 function pickRecorder(recorders: Candidate[], requestedChannels: number | null) {
@@ -161,7 +193,6 @@ function pickRecorder(recorders: Candidate[], requestedChannels: number | null) 
 }
 
 function pickCameras(cameras: Candidate[], max = 3) {
-  // prix croissant TTC si possible, sinon score
   const sorted = [...cameras].sort((a, b) => {
     const pa = priceTTC(a.price_ht) ?? Number.POSITIVE_INFINITY;
     const pb = priceTTC(b.price_ht) ?? Number.POSITIVE_INFINITY;
@@ -176,7 +207,6 @@ function commercialLabel(c: Candidate) {
   const sku = (c.sku || "").trim();
   const brand = (c.brand || "").trim();
 
-  // on évite la répétition si déjà dans le name
   const hasSkuInName = sku && name.toLowerCase().includes(sku.toLowerCase());
   const parts: string[] = [];
   if (name) parts.push(name);
@@ -188,50 +218,116 @@ function commercialLabel(c: Candidate) {
 function benefitShort(c: Candidate) {
   const b = c.payload?.benefice_court || c.payload?.["benefice-court"];
   if (typeof b === "string" && b.trim()) return b.trim();
-  // fallback factuel ultra court
   if (isRecorder(c)) return "Enregistrement fiable et accès à distance.";
   if (isCamera(c)) return "Surveillance IP, image nette, vision nuit selon modèle.";
   return "Produit adapté à la vidéosurveillance.";
 }
 
+async function ensureConversation(supa: ReturnType<typeof supabaseAdmin>, id: string, scope: string) {
+  // crée si absent
+  await supa.from("conversations").upsert(
+    { id, scope, updated_at: new Date().toISOString() },
+    { onConflict: "id" }
+  );
+}
+
+async function addMessage(
+  supa: ReturnType<typeof supabaseAdmin>,
+  conversationId: string,
+  role: "user" | "assistant" | "system",
+  content: string,
+  meta?: any
+) {
+  await supa.from("conversation_messages").insert({
+    conversation_id: conversationId,
+    role,
+    content,
+    meta: meta ?? null,
+  });
+}
+
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as ChatBody;
-    const input = (body.input || "").trim();
-    if (!input) return Response.json({ ok: false, error: "Missing input" }, { status: 400 });
+    const body = (await req.json().catch(() => null)) as ChatBody | null;
+    const input = (body?.input || "").trim();
+    const debug = !!body?.debug;
 
-    const debug = !!body.debug;
-    const conversationId = body.conversationId ?? crypto.randomUUID();
-    const need = detectNeed(input);
+    const jar = await cookies();
+    let conversationId = jar.get(COOKIE_NAME)?.value || null;
+
+    // action reset / close / reopen (sans input obligatoire)
+    const action = body?.action;
 
     const supa = supabaseAdmin();
 
-    // ---- mémoire (si table conversations existe)
+    if (action === "reset") {
+      // nouvelle conv
+      conversationId = crypto.randomUUID();
+      jar.set(COOKIE_NAME, conversationId, { httpOnly: true, sameSite: "lax", path: "/" });
+      await ensureConversation(supa, conversationId, "general");
+      return Response.json({ ok: true, conversationId, reset: true });
+    }
+
+    if (!conversationId) {
+      conversationId = crypto.randomUUID();
+      jar.set(COOKIE_NAME, conversationId, { httpOnly: true, sameSite: "lax", path: "/" });
+    }
+
+    if (action === "close") {
+      await supa.from("conversations").update({ closed_at: new Date().toISOString() }).eq("id", conversationId);
+      return Response.json({ ok: true, conversationId, closed: true });
+    }
+
+    if (action === "reopen") {
+      await supa.from("conversations").update({ closed_at: null }).eq("id", conversationId);
+      return Response.json({ ok: true, conversationId, reopened: true });
+    }
+
+    if (!input) return Response.json({ ok: false, error: "Missing input" }, { status: 400 });
+
+    const scope = isVideoScope(input) ? "video" : "general";
+    await ensureConversation(supa, conversationId, scope);
+
+    // log user message
+    await addMessage(supa, conversationId, "user", input);
+
+    // pinned recorder?
     let pinnedRecorderId: number | null = null;
     try {
       const { data: conv } = await supa
         .from("conversations")
-        .select("id,picked_recorder_id")
+        .select("picked_recorder_id,closed_at,scope")
         .eq("id", conversationId)
         .maybeSingle();
 
+      if (conv?.closed_at) {
+        return Response.json(
+          { ok: false, error: "Conversation closed", details: "Send action=reopen or action=reset" },
+          { status: 409 }
+        );
+      }
+
       if (conv?.picked_recorder_id) pinnedRecorderId = Number(conv.picked_recorder_id) || null;
     } catch {
-      // pas bloquant
+      // non bloquant
     }
 
-    // ---- load catalogue
+    const need = detectNeed(input);
+
+    // load catalogue
     const { data: raw, error } = await supa
       .from("products")
       .select("id,name,url,price,currency,product_type,product_kind,brand,sku,fiche_technique_url,payload")
-      .limit(2000);
+      .limit(3000);
 
-    if (error) return Response.json({ ok: false, error: "Supabase query failed", details: error.message }, { status: 500 });
+    if (error) {
+      return Response.json({ ok: false, error: "Supabase query failed", details: error.message }, { status: 500 });
+    }
 
     const rows = Array.isArray(raw) ? raw : [];
     const tokens = tokenize(input);
 
-    const all: Candidate[] = rows
+    let all: Candidate[] = rows
       .map((r: any) => {
         const id = Number(r.id);
         if (!Number.isFinite(id)) return null;
@@ -256,7 +352,6 @@ export async function POST(req: Request) {
           sku,
           fiche_technique_url: (r.fiche_technique_url || null) as string | null,
           payload: r.payload || null,
-
           channels: extractChannels(name || ""),
           isIP,
           isPoE,
@@ -265,10 +360,15 @@ export async function POST(req: Request) {
       })
       .filter(Boolean) as Candidate[];
 
+    // ✅ EXCLUSION AJAX : si scope video => on sort TOUT ajax
+    if (scope === "video") {
+      all = all.filter((c) => !isAjaxProduct(c));
+    }
+
     let recorders = all.filter(isRecorder);
     let cameras = all.filter(isCamera);
 
-    // filtres IP / PoE demandés
+    // filtres IP/PoE
     if (need.wantsIP) {
       recorders = recorders.filter((c) => c.isIP);
       cameras = cameras.filter((c) => c.isIP);
@@ -277,10 +377,7 @@ export async function POST(req: Request) {
       cameras = cameras.filter((c) => c.isPoE || c.isIP);
     }
 
-    // exclure MotionCam / Ajax si "caméras IP"
-    cameras = cameras.filter((c) => excludeNonIPCameras(c, need));
-
-    // ---- pick recorder (pinned > exact > fallback)
+    // pick recorder
     let chosenRecorder: Candidate | null = null;
     let pickedMode: "pinned" | "exact" | "fallback" | "none" = "none";
 
@@ -295,108 +392,91 @@ export async function POST(req: Request) {
       pickedMode = picked.exact ? "exact" : picked.fallback ? "fallback" : "none";
     }
 
-    // ---- pick cameras
-    const chosenCameras = need.wantsCamera ? pickCameras(cameras, 3) : [];
-
-    // ---- persist pinned recorder
+    // persist pinned recorder
     if (chosenRecorder) {
-      try {
-        await supa.from("conversations").upsert(
-          { id: conversationId, picked_recorder_id: chosenRecorder.id, updated_at: new Date().toISOString() },
-          { onConflict: "id" }
-        );
-      } catch {
-        // pas bloquant
-      }
+      await supa
+        .from("conversations")
+        .update({ picked_recorder_id: chosenRecorder.id, updated_at: new Date().toISOString() })
+        .eq("id", conversationId);
     }
 
-    // ---- build strict context for the model (DB truth only)
-    const recorderLine = (c: Candidate) => {
-      const ttc = priceTTC(c.price_ht);
-      const priceStr = ttc !== null ? `${fmtEuro(ttc)} € TTC` : "Prix : voir page produit";
-      const ft = c.fiche_technique_url ? c.fiche_technique_url : "N/A";
-      return [
-        `LABEL: ${commercialLabel(c)}`,
-        `CANALS: ${c.channels ?? "N/A"}`,
-        `POE: ${c.isPoE ? "oui" : "non"}`,
-        `PRICE_TTC: ${priceStr}`,
-        `URL: ${c.url || "N/A"}`,
-        `FT: ${ft}`,
-        `BENEFIT: ${benefitShort(c)}`,
-      ].join("\n");
-    };
+    // pick cameras (si demandées)
+    const chosenCameras = need.wantsCamera ? pickCameras(cameras, 3) : [];
 
-    const cameraLine = (c: Candidate) => {
-      const ttc = priceTTC(c.price_ht);
-      const priceStr = ttc !== null ? `${fmtEuro(ttc)} € TTC` : "Prix : voir page produit";
-      const ft = c.fiche_technique_url ? c.fiche_technique_url : "N/A";
-      return [
-        `LABEL: ${commercialLabel(c)}`,
-        `PRICE_TTC: ${priceStr}`,
-        `URL: ${c.url || "N/A"}`,
-        `FT: ${ft}`,
-        `BENEFIT: ${benefitShort(c)}`,
-      ].join("\n");
-    };
+    // context strict
+    const recorderBlock = chosenRecorder
+      ? `RECORDER:
+LABEL: ${commercialLabel(chosenRecorder)}
+CANALS: ${chosenRecorder.channels ?? "N/A"}
+POE: ${chosenRecorder.isPoE ? "oui" : "non"}
+PRICE_TTC: ${
+          priceTTC(chosenRecorder.price_ht) !== null
+            ? `${fmtEuro(priceTTC(chosenRecorder.price_ht) as number)} € TTC`
+            : "Prix : voir page produit"
+        }
+URL: ${chosenRecorder.url || "N/A"}
+FT: ${chosenRecorder.fiche_technique_url || "N/A"}
+BENEFIT: ${benefitShort(chosenRecorder)}
+`
+      : `RECORDER: NONE`;
 
-    const missingRecorder = need.wantsRecorder && !chosenRecorder;
-    const missingCams = need.wantsCamera && chosenCameras.length === 0;
+    const camerasBlock = chosenCameras.length
+      ? `CAMERAS (price ascending):
+${chosenCameras
+  .map((c, i) => {
+    const ttc = priceTTC(c.price_ht);
+    return `CAM_${i + 1}:
+LABEL: ${commercialLabel(c)}
+PRICE_TTC: ${ttc !== null ? `${fmtEuro(ttc)} € TTC` : "Prix : voir page produit"}
+URL: ${c.url || "N/A"}
+FT: ${c.fiche_technique_url || "N/A"}
+BENEFIT: ${benefitShort(c)}
+`;
+  })
+  .join("\n")}`
+      : `CAMERAS: NONE`;
 
     const policy = `
 RÈGLES ABSOLUES:
-- Tu ne DOIS utiliser que les produits fournis dans [RECORDER] et [CAMERAS].
-- Interdiction d'inventer des produits, des liens, des prix, des fiches techniques.
-- Affiche TOUJOURS les prix en TTC quand présents (PRICE_TTC).
-- Titre commercial obligatoire: "Nom + Référence + de chez Marque".
-- Si le client demande X canaux et qu'on n'a pas exact:
-  => dire explicitement: "Nous n’avons pas X canaux, la meilleure alternative est Y canaux."
-- Caméras: 3 propositions, triées prix croissant, chacune = LABEL + PRICE_TTC + URL + FT + BENEFIT.
-- Finir par 3 questions groupées (caméras en place / jours d’archive & HDD / résolution & budget).
-- Ne propose JAMAIS MotionCam / Ajax si la demande est "caméras IP".
+- Tu ne dois utiliser QUE les produits fournis dans RECORDER et CAMERAS.
+- Interdiction d'inventer produits/liens/prix/FT.
+- Prix toujours TTC quand présent (PRICE_TTC).
+- Style commercial: "Nom + Référence + de chez Marque" + prix TTC.
+- Si canaux demandés non dispo: l'indiquer clairement et proposer la meilleure alternative.
+- Caméras: 3 propositions, triées prix croissant, chacune avec LABEL, PRICE_TTC, URL, FT, BENEFIT.
+- Finir par 3 questions GROUPÉES (caméras existantes / jours d’archive & HDD / résolution & budget).
+- Contexte "video": interdiction de proposer Ajax.
 `.trim();
 
     const needBlock = `
 BESOIN:
-- wantsRecorder=${need.wantsRecorder}
-- wantsCamera=${need.wantsCamera}
-- wantsIP=${need.wantsIP}
-- wantsPoE=${need.wantsPoE}
-- requestedChannels=${need.requestedChannels ?? "N/A"}
-- budget=${need.budget ?? "N/A"}
-- pickedMode=${pickedMode}
-`.trim();
-
-    const recorderBlock = chosenRecorder ? `[RECORDER]\n${recorderLine(chosenRecorder)}\n` : "";
-    const camerasBlock = chosenCameras.length
-      ? `[CAMERAS]\n${chosenCameras.map((c, i) => `CAM_${i + 1}\n${cameraLine(c)}`).join("\n\n")}\n`
-      : "";
-
-    const availabilityNote = `
-DISPONIBILITÉ:
-- missingRecorder=${missingRecorder}
-- missingCams=${missingCams}
-`.trim();
-
-    const context = `
-${policy}
-
-${needBlock}
-${availabilityNote}
-
-${recorderBlock}
-${camerasBlock}
+wantsRecorder=${need.wantsRecorder}
+wantsCamera=${need.wantsCamera}
+wantsIP=${need.wantsIP}
+wantsPoE=${need.wantsPoE}
+requestedChannels=${need.requestedChannels ?? "N/A"}
+budget=${need.budget ?? "N/A"}
+pickedMode=${pickedMode}
+scope=${scope}
 `.trim();
 
     const messages = [
       { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
-      { role: "system" as const, content: context },
+      { role: "system" as const, content: `${policy}\n\n${needBlock}\n\n${recorderBlock}\n\n${camerasBlock}` },
       { role: "user" as const, content: input },
     ];
 
     const reply = await chatCompletion(messages);
 
-    // sources = uniquement produits choisis
-    const ragSources = [chosenRecorder, ...chosenCameras]
+    // log assistant message (avec meta utile)
+    await addMessage(supa, conversationId, "assistant", reply, {
+      scope,
+      pickedMode,
+      recorderId: chosenRecorder?.id ?? null,
+      cameraIds: chosenCameras.map((c) => c.id),
+    });
+
+    const sources = [chosenRecorder, ...chosenCameras]
       .filter(Boolean)
       .map((c) => ({ id: (c as Candidate).id, url: (c as Candidate).url }));
 
@@ -404,10 +484,11 @@ ${camerasBlock}
       ok: true,
       conversationId,
       reply,
-      rag: { used: ragSources.length ? 1 : 0, sources: ragSources },
+      rag: { used: sources.length ? 1 : 0, sources },
       ...(debug
         ? {
             debug: {
+              scope,
               need,
               pickedMode,
               pinnedRecorderId,
@@ -415,10 +496,7 @@ ${camerasBlock}
                 recorder: chosenRecorder ? { id: chosenRecorder.id, url: chosenRecorder.url, label: commercialLabel(chosenRecorder) } : null,
                 cameras: chosenCameras.map((c) => ({ id: c.id, url: c.url, label: commercialLabel(c) })),
               },
-              counts: {
-                recorders: recorders.length,
-                cameras: cameras.length,
-              },
+              counts: { all: all.length, recorders: recorders.length, cameras: cameras.length },
             },
           }
         : {}),
