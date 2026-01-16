@@ -1,66 +1,54 @@
 // app/ai/api/chat/route.ts
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 import { chatCompletion, CAMPROTECT_SYSTEM_PROMPT } from "@/lib/openai";
-import { cookies } from "next/headers";
 
 export const runtime = "nodejs";
 
 type ChatBody = {
-  input?: string;
+  input: string;
+  conversationId?: string;
   debug?: boolean;
-  action?: "reset" | "close" | "reopen";
 };
 
 type Candidate = {
   id: number;
   name: string | null;
   url: string | null;
-  price_ht: number | null;
+
+  // prix final (produit ou min variant)
+  price: number | null;
   currency: string | null;
 
   product_type: string | null;
-  brand: string | null;
   sku: string | null;
-  fiche_technique_url: string | null;
-  payload: any;
+
+  fiche_technique_url?: string | null;
+
+  // ✅ Brand (option id) + name lisible via webflow_option_map
+  brand_option_id?: string | null;
+  brand_name?: string | null;
 
   channels: number | null;
-  isIP: boolean;
-  isPoE: boolean;
-  score: number;
+  poe: boolean;
+  ip: boolean;
+
+  // debug only
+  min_variant_price?: number | null;
 };
 
-const TVA = 0.2;
-const COOKIE_NAME = "cp_conv_id";
-
-function priceTTC(ht: number | null): number | null {
-  if (typeof ht !== "number") return null;
-  return Math.round(ht * (1 + TVA) * 100) / 100;
-}
-function fmtEuro(n: number) {
-  return n.toFixed(2).replace(".", ",");
-}
 function extractChannels(text: string): number | null {
   if (!text) return null;
-  const m = text.match(/(\d{1,2})\s*(canaux|ch|voies)\b/i);
-  return m ? Number(m[1]) : null;
-}
-function tokenize(input: string): string[] {
-  return (input || "")
-    .toLowerCase()
-    .replace(/[’'"]/g, " ")
-    .replace(/[^a-z0-9àâäéèêëîïôöùûüç\s-]/g, " ")
-    .split(/\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(0, 20);
+  const m1 = text.match(/(\d{1,2})\s*(canaux|ch|voies)\b/i);
+  if (m1) return Number(m1[1]);
+  return null;
 }
 
 function detectNeed(input: string) {
-  const t = (input || "").toLowerCase();
+  const t = input.toLowerCase();
 
   const wantsRecorder =
     t.includes("enregistreur") || t.includes("nvr") || t.includes("dvr") || t.includes("xvr");
+
   const wantsCamera =
     t.includes("caméra") || t.includes("camera") || t.includes("caméras") || t.includes("cameras");
 
@@ -68,380 +56,300 @@ function detectNeed(input: string) {
   const wantsPoE = t.includes("poe");
 
   const m = t.match(/(\d{1,2})\s*(cam(é|e)ras?|camera|canaux|ch|voies)\b/i);
-  const requestedChannels = m ? Number(m[1]) : null;
-
-  const mb = t.match(/(\d{2,6})\s*(€|eur|euro)/i);
-  const budget = mb ? Number(mb[1]) : null;
+  const channels = m ? Number(m[1]) : null;
 
   return {
     wantsRecorder,
     wantsCamera,
     wantsIP,
     wantsPoE,
-    requestedChannels: requestedChannels && requestedChannels > 0 ? requestedChannels : null,
-    budget: Number.isFinite(budget as any) ? (budget as number) : null,
+    requestedChannels: channels && channels > 0 ? channels : null,
   };
 }
 
-function buildHaystack(r: any): string {
-  const p = r?.payload || {};
-  const parts: string[] = [];
-  parts.push((r?.name || p?.name || "").toString());
-  parts.push((r?.sku || p?.["product-reference"] || p?.["code-fabricant"] || "").toString());
-  parts.push((r?.product_type || "").toString());
-  parts.push((r?.brand || p?.fabricant || p?.fabricants || "").toString());
-  parts.push((p?.altword || "").toString());
-  parts.push((p?.["description-mini"] || "").toString());
-  parts.push((p?.description || "").toString());
-  parts.push((p?.slug || "").toString());
-  return parts.join(" ").toLowerCase();
-}
+function pickBestRecorder(candidates: Candidate[], requestedChannels: number | null) {
+  if (!candidates.length) return { exact: null as Candidate | null, fallback: null as Candidate | null };
 
-function detectIPPoE(hay: string) {
-  const isPoE =
-    hay.includes("poe") ||
-    hay.includes("802.3af") ||
-    hay.includes("802.3at") ||
-    hay.includes("802.3bt");
-  const isIP = hay.includes("ip") || hay.includes("onvif") || hay.includes("rtsp") || hay.includes("nvr");
-  return { isIP, isPoE };
-}
-
-function scoreCandidate(tokens: string[], hay: string) {
-  let score = 0;
-  for (const tok of tokens) {
-    if (!tok) continue;
-    if (hay.includes(tok)) score += 2;
-    const looksLikeRef = /[0-9]/.test(tok) && (tok.includes("-") || tok.includes("/") || tok.length >= 6);
-    if (looksLikeRef && hay.includes(tok)) score += 6;
+  if (!requestedChannels) {
+    const sorted = [...candidates].sort((a, b) => {
+      const ca = a.channels ?? 9999;
+      const cb = b.channels ?? 9999;
+      return ca - cb;
+    });
+    return { exact: sorted[0] ?? null, fallback: null };
   }
-  if (hay.includes("poe")) score += 1;
-  if (hay.includes("ip") || hay.includes("onvif")) score += 1;
-  return score;
-}
 
-function isAjaxProduct(hay: string) {
-  return hay.includes("ajax") || hay.includes("jeweller") || hay.includes("fibra") || hay.includes("motioncam");
-}
-function isRecorderHay(hay: string) {
-  return hay.includes("enregistreur") || hay.includes("nvr") || hay.includes("dvr") || hay.includes("xvr");
-}
-function isCameraHay(hay: string) {
-  return (
-    hay.includes("caméra") ||
-    hay.includes("camera") ||
-    hay.includes("dome") ||
-    hay.includes("bullet") ||
-    hay.includes("tubulaire") ||
-    hay.includes("varifocale") ||
-    hay.includes("ir")
-  );
-}
-
-function pickRecorder(recorders: Candidate[], requestedChannels: number | null) {
-  if (!recorders.length) return { exact: null as Candidate | null, fallback: null as Candidate | null };
-
-  const sorted = [...recorders].sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    const ca = a.channels ?? 9999;
-    const cb = b.channels ?? 9999;
-    return ca - cb;
-  });
-
-  if (!requestedChannels) return { exact: sorted[0] ?? null, fallback: null };
-
-  const exact = sorted.find((c) => c.channels === requestedChannels) ?? null;
+  const exact = candidates.find((c) => c.channels === requestedChannels) ?? null;
   if (exact) return { exact, fallback: null };
 
-  const higher = sorted
+  const higher = candidates
     .filter((c) => typeof c.channels === "number" && (c.channels as number) > requestedChannels)
     .sort((a, b) => (a.channels as number) - (b.channels as number));
 
   return { exact: null, fallback: higher[0] ?? null };
 }
 
-function pickCameras(cameras: Candidate[], max = 3) {
-  const sorted = [...cameras].sort((a, b) => {
-    const pa = priceTTC(a.price_ht) ?? Number.POSITIVE_INFINITY;
-    const pb = priceTTC(b.price_ht) ?? Number.POSITIVE_INFINITY;
-    if (pa !== pb) return pa - pb;
-    return b.score - a.score;
-  });
-  return sorted.slice(0, max);
-}
-
-function commercialLabel(c: Candidate) {
-  const name = (c.name || "").trim();
-  const sku = (c.sku || "").trim();
-  const brand = (c.brand || "").trim();
-
-  const hasSkuInName = sku && name.toLowerCase().includes(sku.toLowerCase());
-  const parts: string[] = [];
-  if (name) parts.push(name);
-  if (sku && !hasSkuInName) parts.push(sku);
-  if (brand) parts.push(`de chez ${brand}`);
-  return parts.join(" ");
-}
-
-function benefitShort(c: Candidate) {
-  const b = c.payload?.benefice_court || c.payload?.["benefice-court"];
-  if (typeof b === "string" && b.trim()) return b.trim();
-  if (buildHaystack(c).includes("nvr") || buildHaystack(c).includes("dvr") || buildHaystack(c).includes("xvr")) {
-    return "Enregistrement fiable et accès à distance.";
-  }
-  if (buildHaystack(c).includes("cam")) return "Image nette et vision nocturne selon modèle.";
-  return "Produit adapté à la vidéosurveillance.";
-}
-
-async function getOptionMap(fieldSlug: string) {
-  const supa = supabaseAdmin();
-  const { data, error } = await supa
-    .from("webflow_option_map")
-    .select("option_id,option_name")
-    .eq("field_slug", fieldSlug)
-    .limit(500);
-
-  if (error || !Array.isArray(data)) return new Map<string, string>();
-  const m = new Map<string, string>();
-  for (const r of data as any[]) {
-    if (r?.option_id && r?.option_name) m.set(String(r.option_id), String(r.option_name));
-  }
-  return m;
-}
-
-async function ensureConversation(supa: ReturnType<typeof supabaseAdmin>, id: string, scope: string) {
-  await supa.from("conversations").upsert(
-    { id, scope, updated_at: new Date().toISOString() },
-    { onConflict: "id" }
+function looksLikeRecorder(c: Candidate) {
+  const t = (c.name || "").toLowerCase();
+  const pt = (c.product_type || "").toLowerCase();
+  const hay = `${t} ${pt} ${(c.sku || "").toLowerCase()}`;
+  return (
+    hay.includes("enregistreur") ||
+    hay.includes("nvr") ||
+    hay.includes("dvr") ||
+    hay.includes("xvr")
   );
 }
 
-async function addMessage(
-  supa: ReturnType<typeof supabaseAdmin>,
-  conversationId: string,
-  role: "user" | "assistant" | "system",
-  content: string,
-  meta?: any
-) {
-  await supa.from("conversation_messages").insert({
-    conversation_id: conversationId,
-    role,
-    content,
-    meta: meta ?? null,
-  });
+function looksLikeCamera(c: Candidate) {
+  const t = (c.name || "").toLowerCase();
+  const pt = (c.product_type || "").toLowerCase();
+  const hay = `${t} ${pt} ${(c.sku || "").toLowerCase()}`;
+  // ajustable selon ton catalogue
+  return (
+    hay.includes("caméra") ||
+    hay.includes("camera") ||
+    pt.includes("cam") ||
+    hay.includes("bullet") ||
+    hay.includes("dôme") ||
+    hay.includes("dome")
+  );
 }
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json().catch(() => null)) as ChatBody | null;
-    const input = (body?.input || "").trim();
-    const debug = !!body?.debug;
-
-    const jar = await cookies();
-    let conversationId = jar.get("cp_conv_id")?.value || null;
-
-    const action = body?.action;
-    const supa = supabaseAdmin();
-
-    if (action === "reset") {
-      conversationId = crypto.randomUUID();
-      jar.set(COOKIE_NAME, conversationId, { httpOnly: true, sameSite: "lax", path: "/" });
-      await ensureConversation(supa, conversationId, "general");
-      return Response.json({ ok: true, conversationId, reset: true });
-    }
-
-    if (!conversationId) {
-      conversationId = crypto.randomUUID();
-      jar.set(COOKIE_NAME, conversationId, { httpOnly: true, sameSite: "lax", path: "/" });
-    }
-
-    if (action === "close") {
-      await supa.from("conversations").update({ closed_at: new Date().toISOString() }).eq("id", conversationId);
-      return Response.json({ ok: true, conversationId, closed: true });
-    }
-    if (action === "reopen") {
-      await supa.from("conversations").update({ closed_at: null }).eq("id", conversationId);
-      return Response.json({ ok: true, conversationId, reopened: true });
-    }
-
+    const body = (await req.json()) as ChatBody;
+    const input = (body.input || "").trim();
     if (!input) return Response.json({ ok: false, error: "Missing input" }, { status: 400 });
 
+    const debug = !!body.debug;
+    const conversationId = body.conversationId ?? crypto.randomUUID();
     const need = detectNeed(input);
 
-    // ✅ scope video : on exclut Ajax (mais surtout, on filtre en SQL)
-    const tokens = tokenize(input);
-    const fabricantsMap = await getOptionMap("fabricants"); // mapping id -> name
+    const supa = supabaseAdmin();
 
-    await ensureConversation(supa, conversationId, "video");
-    await addMessage(supa, conversationId, "user", input);
+    // 0) Charger le mapping "fabricants" (option_id -> option_name)
+    const brandMap = new Map<string, string>();
+    {
+      const { data: opts, error: optErr } = await supa
+        .from("webflow_option_map")
+        .select("option_id, option_name")
+        .eq("field_slug", "fabricants")
+        .limit(500);
 
-    // ✅ Filtrage SQL pour éviter 504 : on ne charge pas tout le catalogue
-    // On charge :
-    // - recorders si besoin enregistreur OU si input contient nvr/dvr/xvr/enregistreur
-    // - cameras si besoin caméra OU si input contient camera/caméra
-    const wantRec = need.wantsRecorder || /(\bnvr\b|\bdvr\b|\bxvr\b|enregistreur)/i.test(input);
-    const wantCam = need.wantsCamera || /(caméra|camera)/i.test(input);
-
-    const baseSelect = "id,name,url,price,currency,product_type,brand,sku,fiche_technique_url,payload";
-
-    async function fetchByKeyword(kind: "rec" | "cam") {
-      const q = kind === "rec"
-        ? "name.ilike.%nvr%,name.ilike.%dvr%,name.ilike.%xvr%,name.ilike.%enregistreur%"
-        : "name.ilike.%caméra%,name.ilike.%camera%,name.ilike.%dome%,name.ilike.%bullet%,name.ilike.%tubulaire%";
-
-      // on limite fort pour éviter timeout
-      const { data, error } = await supa
-        .from("products")
-        .select(baseSelect)
-        .or(q)
-        .limit(400);
-
-      if (error) throw new Error(`Supabase query failed: ${error.message}`);
-      return Array.isArray(data) ? data : [];
-    }
-
-    const [rawRec, rawCam] = await Promise.all([
-      wantRec ? fetchByKeyword("rec") : Promise.resolve([]),
-      wantCam ? fetchByKeyword("cam") : Promise.resolve([]),
-    ]);
-
-    // si l’utilisateur est vague, on prend un petit set général (utile)
-    let raw = [...rawRec, ...rawCam];
-    if (!raw.length) {
-      const { data, error } = await supa.from("products").select(baseSelect).limit(300);
-      if (error) throw new Error(`Supabase query failed: ${error.message}`);
-      raw = Array.isArray(data) ? data : [];
-    }
-
-    // Dédup par id
-    const seen = new Set<number>();
-    const rows = raw.filter((r: any) => {
-      const id = Number(r?.id);
-      if (!Number.isFinite(id)) return false;
-      if (seen.has(id)) return false;
-      seen.add(id);
-      return true;
-    });
-
-    let all: Candidate[] = rows.map((r: any) => {
-      const id = Number(r.id);
-      const hay = buildHaystack(r);
-      const { isIP, isPoE } = detectIPPoE(hay);
-      const score = scoreCandidate(tokens, hay);
-
-      // ✅ brand : si c’est un ID d’option Webflow, on le convertit
-      const p = r.payload || {};
-      const rawBrandId = String(r.brand || p.fabricant || p.fabricants || "").trim();
-      const mappedBrand = fabricantsMap.get(rawBrandId) || rawBrandId || null;
-
-      const name = (r.name || p.name || "").toString().trim() || null;
-      const sku = (r.sku || p["product-reference"] || p["code-fabricant"] || "").toString().trim() || null;
-
-      return {
-        id,
-        name,
-        url: (r.url || null) as string | null,
-        price_ht: typeof r.price === "number" ? r.price : null,
-        currency: (r.currency || "EUR") as string | null,
-        product_type: (r.product_type || null) as string | null,
-        brand: mappedBrand,
-        sku,
-        fiche_technique_url: (r.fiche_technique_url || null) as string | null,
-        payload: p,
-        channels: extractChannels(name || ""),
-        isIP,
-        isPoE,
-        score,
-      };
-    });
-
-    // ✅ Exclusion Ajax sur toute la sélection
-    all = all.filter((c) => !isAjaxProduct(buildHaystack(c)));
-
-    let recorders = all.filter((c) => isRecorderHay(buildHaystack(c)));
-    let cameras = all.filter((c) => isCameraHay(buildHaystack(c)));
-
-    if (need.wantsIP) {
-      recorders = recorders.filter((c) => c.isIP);
-      cameras = cameras.filter((c) => c.isIP);
-    }
-    if (need.wantsPoE) {
-      recorders = recorders.filter((c) => c.isPoE || c.isIP);
-      cameras = cameras.filter((c) => c.isPoE || c.isIP);
-    }
-
-    const picked = need.wantsRecorder ? pickRecorder(recorders, need.requestedChannels) : { exact: null, fallback: null };
-    const chosenRecorder = picked.exact || picked.fallback;
-    const chosenCameras = need.wantsCamera ? pickCameras(cameras, 3) : [];
-
-    const ragSources = [chosenRecorder, ...chosenCameras].filter(Boolean).map((c: any) => ({ id: c.id, url: c.url }));
-
-    const recorderBlock = chosenRecorder
-      ? `RECORDER:
-LABEL: ${commercialLabel(chosenRecorder)}
-CANALS: ${chosenRecorder.channels ?? "N/A"}
-POE: ${chosenRecorder.isPoE ? "oui" : "non"}
-PRICE_TTC: ${
-          priceTTC(chosenRecorder.price_ht) !== null
-            ? `${fmtEuro(priceTTC(chosenRecorder.price_ht) as number)} € TTC`
-            : "Prix : voir page produit"
+      if (optErr) {
+        // On ne bloque pas l'API si le mapping est vide, mais on le remonte en debug.
+        // (Le reste fonctionnera, on aura juste brand_name = null)
+      } else if (Array.isArray(opts)) {
+        for (const o of opts as any[]) {
+          if (o?.option_id && o?.option_name) brandMap.set(String(o.option_id), String(o.option_name));
         }
-URL: ${chosenRecorder.url || "N/A"}
-FT: ${chosenRecorder.fiche_technique_url || "N/A"}
-BENEFIT: ${benefitShort(chosenRecorder)}
-`
-      : `RECORDER: NONE`;
+      }
+    }
 
-    const camerasBlock = chosenCameras.length
-      ? `CAMERAS (price ascending):
-${chosenCameras
-  .map((c, i) => {
-    const ttc = priceTTC(c.price_ht);
-    return `CAM_${i + 1}:
-LABEL: ${commercialLabel(c)}
-PRICE_TTC: ${ttc !== null ? `${fmtEuro(ttc)} € TTC` : "Prix : voir page produit"}
-URL: ${c.url || "N/A"}
-FT: ${c.fiche_technique_url || "N/A"}
-BENEFIT: ${benefitShort(c)}
-`;
-  })
-  .join("\n")}`
-      : `CAMERAS: NONE`;
+    // 1) Load products
+    const { data: raw, error } = await supa
+      .from("products")
+      .select("id,name,url,price,currency,product_type,sku,fiche_technique_url,brand,payload")
+      .limit(600);
+
+    if (error) {
+      return Response.json({ ok: false, error: "Supabase query failed", details: error.message }, { status: 500 });
+    }
+
+    const rows = Array.isArray(raw) ? raw : [];
+    const productIds = rows.map((r: any) => Number(r.id)).filter((n) => Number.isFinite(n));
+
+    // 2) Load min price per product from variants (fallback)
+    const minPriceByProductId = new Map<number, number>();
+
+    if (productIds.length) {
+      const { data: vars, error: vErr } = await supa
+        .from("product_variants")
+        .select("product_id,price")
+        .in("product_id", productIds);
+
+      if (!vErr && Array.isArray(vars)) {
+        for (const v of vars as any[]) {
+          const pid = Number(v.product_id);
+          const p = typeof v.price === "number" ? v.price : null;
+          if (!Number.isFinite(pid) || p === null) continue;
+
+          const prev = minPriceByProductId.get(pid);
+          if (prev === undefined || p < prev) minPriceByProductId.set(pid, p);
+        }
+      }
+    }
+
+    // 3) Build candidates + brand readable + exclude AJAX
+    const candidatesAll: Candidate[] = rows
+      .map((r: any) => {
+        const name = (r.name || r.payload?.name || "").toString().trim() || null;
+        const productType = (r.product_type || "").toString().trim() || null;
+        const sku = (r.sku || null) as string | null;
+
+        const pid = Number(r.id);
+        const minVar = minPriceByProductId.get(pid) ?? null;
+
+        const finalPrice =
+          typeof r.price === "number" ? r.price : (typeof minVar === "number" ? minVar : null);
+
+        const hay = `${name || ""} ${productType || ""} ${sku || ""}`.toLowerCase();
+        const channels = extractChannels(name || "");
+        const poe = hay.includes("poe");
+        const ip = hay.includes("nvr") || hay.includes("ip");
+
+        const brandOptionId = (r.brand ?? r.payload?.brand ?? null) as string | null;
+        const brandName = brandOptionId ? (brandMap.get(String(brandOptionId)) ?? null) : null;
+
+        return {
+          id: pid,
+          name,
+          url: (r.url || null) as string | null,
+          price: finalPrice,
+          currency: (r.currency || "EUR") as string | null,
+          product_type: productType,
+          sku,
+          fiche_technique_url: (r.fiche_technique_url || null) as string | null,
+          brand_option_id: brandOptionId,
+          brand_name: brandName,
+
+          channels,
+          poe,
+          ip,
+          min_variant_price: minVar,
+        };
+      })
+      // ✅ EXCLURE TOUS LES PRODUITS AJAX
+      .filter((c) => (c.brand_name || "").toUpperCase() !== "AJAX");
+
+    // 4) Choisir un “recorder” si demandé
+    let recorderCandidates = candidatesAll.filter(looksLikeRecorder);
+    if (need.wantsIP) recorderCandidates = recorderCandidates.filter((c) => c.ip);
+    if (need.wantsPoE) recorderCandidates = recorderCandidates.filter((c) => c.poe);
+
+    if (!recorderCandidates.length && need.wantsIP) {
+      recorderCandidates = candidatesAll.filter(looksLikeRecorder).filter((c) => c.ip);
+    }
+    if (!recorderCandidates.length) {
+      recorderCandidates = candidatesAll.filter(looksLikeRecorder);
+    }
+
+    const picked = pickBestRecorder(recorderCandidates, need.requestedChannels);
+
+    // 5) Candidats caméras si demandé (on ne les “inventera” pas : uniquement produits réels)
+    //    -> tri prix croissant
+    let cameraCandidates: Candidate[] = [];
+    if (need.wantsCamera) {
+      cameraCandidates = candidatesAll.filter(looksLikeCamera);
+
+      // si user veut IP, on pousse les caméras "ip" (selon ton heuristic)
+      if (need.wantsIP) {
+        const ipFirst = cameraCandidates.filter((c) => c.ip || (c.product_type || "").toLowerCase().includes("réseau"));
+        const rest = cameraCandidates.filter((c) => !ipFirst.includes(c));
+        cameraCandidates = [...ipFirst, ...rest];
+      }
+
+      cameraCandidates = cameraCandidates
+        .filter((c) => typeof c.price === "number" && !!c.url) // on veut des caméras “vendables”
+        .sort((a, b) => (a.price as number) - (b.price as number))
+        .slice(0, 3);
+    }
+
+    const ragSources = [
+      ...(picked.exact ? [{ id: picked.exact.id, url: picked.exact.url }] : []),
+      ...(picked.fallback ? [{ id: picked.fallback.id, url: picked.fallback.url }] : []),
+      ...cameraCandidates.map((c) => ({ id: c.id, url: c.url })),
+    ].slice(0, 6);
+
+    const formatEUR = (n: number) => n.toFixed(2).replace(".", ",");
+    const formatPriceTTC = (c: Candidate) => {
+      if (typeof c.price === "number") return `${formatEUR(c.price)} € TTC`;
+      return "Voir page produit";
+    };
+
+    const formatOneLine = (c: Candidate) => {
+      const brand = c.brand_name ? ` de chez ${c.brand_name}` : "";
+      const ref = c.sku ? ` ${c.sku}` : "";
+      return `${c.name || "Produit"}${ref}${brand}`;
+    };
+
+    const productBlock = (label: string, c: Candidate) => {
+      const lines = [
+        `${label}`,
+        `Nom : ${formatOneLine(c)}`,
+        `Prix : ${formatPriceTTC(c)}`,
+        `Lien : ${c.url || "N/A"}`,
+      ];
+      if (typeof c.channels === "number") lines.splice(2, 0, `Canaux : ${c.channels}`);
+      lines.splice(3, 0, `PoE : ${c.poe ? "oui" : "non"}`);
+      if (c.fiche_technique_url) lines.push(`Fiche technique : ${c.fiche_technique_url}`);
+      return lines.join("\n");
+    };
 
     const policy = `
-RÈGLES ABSOLUES:
-- Tu ne dois utiliser QUE les produits fournis dans RECORDER et CAMERAS.
-- Interdiction d'inventer produits/liens/prix/FT.
-- Prix toujours TTC quand présent (PRICE_TTC).
-- Format commercial: "Nom + Référence + de chez Marque" + prix TTC.
-- Si canaux demandés non dispo: l’indiquer clairement et proposer la meilleure alternative.
-- Caméras: 3 propositions, triées prix croissant, chacune avec LABEL, PRICE_TTC, URL, FT, BENEFIT.
-- Finir par 3 questions regroupées (caméras existantes / jours d’archive & HDD / résolution & budget).
-- Contexte video: interdiction de proposer Ajax.
+RÈGLES STRICTES:
+- Tu n'inventes JAMAIS de produits. Tu utilises UNIQUEMENT les produits listés ci-dessous.
+- Tu n'inventes JAMAIS d'URL (produit ou fiche technique).
+- Exclure totalement les produits AJAX (déjà filtrés, mais ne jamais en parler).
+- Toujours afficher le prix avec "€ TTC" si disponible.
+- Format commercial: "Nom + Référence + Marque" (ex: Enregistreur NVR 4 canaux DS-7604... de chez HIKVISION)
+- Si le client demande un nombre de canaux non disponible (ex: 6), dire clairement pourquoi et proposer l'alternative au-dessus.
+
+FORMAT DE RÉPONSE:
+1) ✅ Produit recommandé (si exact) OU ℹ️ Alternative proposée (si fallback)
+2) 4 à 7 lignes max pour l’enregistreur (incluant lien + prix + FT si dispo)
+3) Si le client a demandé aussi des caméras: proposer 3 caméras réelles (prix croissant) avec (Nom+Réf+Marque, Prix TTC, Lien, FT si dispo)
+4) Terminer par 2-3 questions naturelles (caméras existantes, jours d’archives/HDD, résolution/4K, budget)
 `.trim();
 
-    const needBlock = `
-BESOIN:
-wantsRecorder=${need.wantsRecorder}
-wantsCamera=${need.wantsCamera}
-wantsIP=${need.wantsIP}
-wantsPoE=${need.wantsPoE}
-requestedChannels=${need.requestedChannels ?? "N/A"}
-budget=${need.budget ?? "N/A"}
+    const needSummary = `
+BESOIN CLIENT:
+- Enregistreur: ${need.wantsRecorder ? "oui" : "non"}
+- Caméras: ${need.wantsCamera ? "oui" : "non"}
+- IP/NVR: ${need.wantsIP ? "oui" : "non"}
+- PoE: ${need.wantsPoE ? "oui" : "non"}
+- Canaux demandés: ${need.requestedChannels ?? "non précisé"}
+`.trim();
+
+    const exactBlock = picked.exact ? productBlock("✅ PRODUIT EXACT", picked.exact) : "";
+    const fallbackBlock = picked.fallback ? productBlock("ℹ️ PRODUIT ALTERNATIF", picked.fallback) : "";
+
+    const camerasBlock = cameraCandidates.length
+      ? `\nCAMÉRAS À PROPOSER (prix croissant):\n${cameraCandidates
+          .map((c, i) => {
+            const brand = c.brand_name ? ` de chez ${c.brand_name}` : "";
+            const ref = c.sku ? ` ${c.sku}` : "";
+            const ft = c.fiche_technique_url ? `\nFiche technique : ${c.fiche_technique_url}` : "";
+            return [
+              `${i + 1}) ${c.name || "Caméra"}${ref}${brand}`,
+              `Prix : ${formatPriceTTC(c)}`,
+              `Lien : ${c.url || "N/A"}`,
+              ft,
+            ]
+              .filter(Boolean)
+              .join("\n");
+          })
+          .join("\n\n")}`
+      : "";
+
+    const context = `
+${policy}
+
+${needSummary}
+
+${exactBlock}
+${fallbackBlock}
+${camerasBlock}
 `.trim();
 
     const messages = [
       { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
-      { role: "system" as const, content: `${policy}\n\n${needBlock}\n\n${recorderBlock}\n\n${camerasBlock}` },
+      { role: "system" as const, content: context },
       { role: "user" as const, content: input },
     ];
 
     const reply = await chatCompletion(messages);
-
-    await addMessage(supa, conversationId, "assistant", reply, {
-      recorderId: chosenRecorder?.id ?? null,
-      cameraIds: chosenCameras.map((c) => c.id),
-    });
 
     return Response.json({
       ok: true,
@@ -452,11 +360,31 @@ budget=${need.budget ?? "N/A"}
         ? {
             debug: {
               need,
-              counts: { all: all.length, recorders: recorders.length, cameras: cameras.length },
               picked: {
-                recorder: chosenRecorder ? { id: chosenRecorder.id, url: chosenRecorder.url, brand: chosenRecorder.brand } : null,
-                cameras: chosenCameras.map((c) => ({ id: c.id, url: c.url, brand: c.brand })),
+                exact: picked.exact
+                  ? {
+                      id: picked.exact.id,
+                      url: picked.exact.url,
+                      channels: picked.exact.channels,
+                      price: picked.exact.price,
+                      brand_name: picked.exact.brand_name,
+                      fiche_technique_url: picked.exact.fiche_technique_url,
+                    }
+                  : null,
+                fallback: picked.fallback
+                  ? {
+                      id: picked.fallback.id,
+                      url: picked.fallback.url,
+                      channels: picked.fallback.channels,
+                      price: picked.fallback.price,
+                      brand_name: picked.fallback.brand_name,
+                      fiche_technique_url: picked.fallback.fiche_technique_url,
+                    }
+                  : null,
               },
+              sample_brand_map_size: brandMap.size,
+              recorder_candidates: recorderCandidates.slice(0, 6),
+              camera_candidates: cameraCandidates,
             },
           }
         : {}),
