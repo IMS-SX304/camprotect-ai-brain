@@ -15,7 +15,7 @@ type Candidate = {
   name: string | null;
   url: string | null;
 
-  // prix final (produit ou min variant)
+  // HT stocké côté Webflow/Supabase
   price: number | null;
   currency: string | null;
 
@@ -24,17 +24,15 @@ type Candidate = {
 
   fiche_technique_url?: string | null;
 
-  // ✅ Brand (option id) + name lisible via webflow_option_map
   brand_option_id?: string | null;
   brand_name?: string | null;
 
   channels: number | null;
   poe: boolean;
   ip: boolean;
-
-  // debug only
-  min_variant_price?: number | null;
 };
+
+const VAT_RATE = 0.2;
 
 function extractChannels(text: string): number | null {
   if (!text) return null;
@@ -93,27 +91,27 @@ function looksLikeRecorder(c: Candidate) {
   const t = (c.name || "").toLowerCase();
   const pt = (c.product_type || "").toLowerCase();
   const hay = `${t} ${pt} ${(c.sku || "").toLowerCase()}`;
-  return (
-    hay.includes("enregistreur") ||
-    hay.includes("nvr") ||
-    hay.includes("dvr") ||
-    hay.includes("xvr")
-  );
+  return hay.includes("enregistreur") || hay.includes("nvr") || hay.includes("dvr") || hay.includes("xvr");
 }
 
 function looksLikeCamera(c: Candidate) {
   const t = (c.name || "").toLowerCase();
   const pt = (c.product_type || "").toLowerCase();
   const hay = `${t} ${pt} ${(c.sku || "").toLowerCase()}`;
-  // ajustable selon ton catalogue
   return (
     hay.includes("caméra") ||
     hay.includes("camera") ||
-    pt.includes("cam") ||
     hay.includes("bullet") ||
     hay.includes("dôme") ||
     hay.includes("dome")
   );
+}
+
+function eur(n: number) {
+  return n.toFixed(2).replace(".", ",");
+}
+function htToTtc(ht: number) {
+  return ht * (1 + VAT_RATE);
 }
 
 export async function POST(req: Request) {
@@ -128,71 +126,40 @@ export async function POST(req: Request) {
 
     const supa = supabaseAdmin();
 
-    // 0) Charger le mapping "fabricants" (option_id -> option_name)
+    // 0) Mapping fabricants (option_id -> option_name)
     const brandMap = new Map<string, string>();
     {
-      const { data: opts, error: optErr } = await supa
+      const { data: opts } = await supa
         .from("webflow_option_map")
         .select("option_id, option_name")
         .eq("field_slug", "fabricants")
         .limit(500);
 
-      if (optErr) {
-        // On ne bloque pas l'API si le mapping est vide, mais on le remonte en debug.
-        // (Le reste fonctionnera, on aura juste brand_name = null)
-      } else if (Array.isArray(opts)) {
+      if (Array.isArray(opts)) {
         for (const o of opts as any[]) {
           if (o?.option_id && o?.option_name) brandMap.set(String(o.option_id), String(o.option_name));
         }
       }
     }
 
-    // 1) Load products
+    // 1) Load products (limite raisonnable pour éviter timeout)
     const { data: raw, error } = await supa
       .from("products")
       .select("id,name,url,price,currency,product_type,sku,fiche_technique_url,brand,payload")
-      .limit(600);
+      .limit(450);
 
     if (error) {
       return Response.json({ ok: false, error: "Supabase query failed", details: error.message }, { status: 500 });
     }
 
     const rows = Array.isArray(raw) ? raw : [];
-    const productIds = rows.map((r: any) => Number(r.id)).filter((n) => Number.isFinite(n));
 
-    // 2) Load min price per product from variants (fallback)
-    const minPriceByProductId = new Map<number, number>();
-
-    if (productIds.length) {
-      const { data: vars, error: vErr } = await supa
-        .from("product_variants")
-        .select("product_id,price")
-        .in("product_id", productIds);
-
-      if (!vErr && Array.isArray(vars)) {
-        for (const v of vars as any[]) {
-          const pid = Number(v.product_id);
-          const p = typeof v.price === "number" ? v.price : null;
-          if (!Number.isFinite(pid) || p === null) continue;
-
-          const prev = minPriceByProductId.get(pid);
-          if (prev === undefined || p < prev) minPriceByProductId.set(pid, p);
-        }
-      }
-    }
-
-    // 3) Build candidates + brand readable + exclude AJAX
+    // 2) Build candidates + brand readable + exclude AJAX
     const candidatesAll: Candidate[] = rows
       .map((r: any) => {
         const name = (r.name || r.payload?.name || "").toString().trim() || null;
         const productType = (r.product_type || "").toString().trim() || null;
         const sku = (r.sku || null) as string | null;
-
-        const pid = Number(r.id);
-        const minVar = minPriceByProductId.get(pid) ?? null;
-
-        const finalPrice =
-          typeof r.price === "number" ? r.price : (typeof minVar === "number" ? minVar : null);
 
         const hay = `${name || ""} ${productType || ""} ${sku || ""}`.toLowerCase();
         const channels = extractChannels(name || "");
@@ -203,27 +170,25 @@ export async function POST(req: Request) {
         const brandName = brandOptionId ? (brandMap.get(String(brandOptionId)) ?? null) : null;
 
         return {
-          id: pid,
+          id: Number(r.id),
           name,
           url: (r.url || null) as string | null,
-          price: finalPrice,
+          price: typeof r.price === "number" ? r.price : null, // HT
           currency: (r.currency || "EUR") as string | null,
           product_type: productType,
           sku,
           fiche_technique_url: (r.fiche_technique_url || null) as string | null,
           brand_option_id: brandOptionId,
           brand_name: brandName,
-
           channels,
           poe,
           ip,
-          min_variant_price: minVar,
         };
       })
-      // ✅ EXCLURE TOUS LES PRODUITS AJAX
+      // ✅ exclure tous les produits AJAX
       .filter((c) => (c.brand_name || "").toUpperCase() !== "AJAX");
 
-    // 4) Choisir un “recorder” si demandé
+    // 3) Recorder candidates
     let recorderCandidates = candidatesAll.filter(looksLikeRecorder);
     if (need.wantsIP) recorderCandidates = recorderCandidates.filter((c) => c.ip);
     if (need.wantsPoE) recorderCandidates = recorderCandidates.filter((c) => c.poe);
@@ -237,21 +202,12 @@ export async function POST(req: Request) {
 
     const picked = pickBestRecorder(recorderCandidates, need.requestedChannels);
 
-    // 5) Candidats caméras si demandé (on ne les “inventera” pas : uniquement produits réels)
-    //    -> tri prix croissant
+    // 4) Camera candidates (si demandé)
     let cameraCandidates: Candidate[] = [];
     if (need.wantsCamera) {
-      cameraCandidates = candidatesAll.filter(looksLikeCamera);
-
-      // si user veut IP, on pousse les caméras "ip" (selon ton heuristic)
-      if (need.wantsIP) {
-        const ipFirst = cameraCandidates.filter((c) => c.ip || (c.product_type || "").toLowerCase().includes("réseau"));
-        const rest = cameraCandidates.filter((c) => !ipFirst.includes(c));
-        cameraCandidates = [...ipFirst, ...rest];
-      }
-
-      cameraCandidates = cameraCandidates
-        .filter((c) => typeof c.price === "number" && !!c.url) // on veut des caméras “vendables”
+      cameraCandidates = candidatesAll
+        .filter(looksLikeCamera)
+        .filter((c) => typeof c.price === "number" && !!c.url)
         .sort((a, b) => (a.price as number) - (b.price as number))
         .slice(0, 3);
     }
@@ -262,9 +218,11 @@ export async function POST(req: Request) {
       ...cameraCandidates.map((c) => ({ id: c.id, url: c.url })),
     ].slice(0, 6);
 
-    const formatEUR = (n: number) => n.toFixed(2).replace(".", ",");
     const formatPriceTTC = (c: Candidate) => {
-      if (typeof c.price === "number") return `${formatEUR(c.price)} € TTC`;
+      if (typeof c.price === "number") {
+        const ttc = htToTtc(c.price);
+        return `${eur(ttc)} € TTC`;
+      }
       return "Voir page produit";
     };
 
@@ -278,12 +236,12 @@ export async function POST(req: Request) {
       const lines = [
         `${label}`,
         `Nom : ${formatOneLine(c)}`,
+        ...(typeof c.channels === "number" ? [`Canaux : ${c.channels}`] : []),
+        `PoE : ${c.poe ? "oui" : "non"}`,
         `Prix : ${formatPriceTTC(c)}`,
         `Lien : ${c.url || "N/A"}`,
+        ...(c.fiche_technique_url ? [`Fiche technique : ${c.fiche_technique_url}`] : []),
       ];
-      if (typeof c.channels === "number") lines.splice(2, 0, `Canaux : ${c.channels}`);
-      lines.splice(3, 0, `PoE : ${c.poe ? "oui" : "non"}`);
-      if (c.fiche_technique_url) lines.push(`Fiche technique : ${c.fiche_technique_url}`);
       return lines.join("\n");
     };
 
@@ -291,15 +249,14 @@ export async function POST(req: Request) {
 RÈGLES STRICTES:
 - Tu n'inventes JAMAIS de produits. Tu utilises UNIQUEMENT les produits listés ci-dessous.
 - Tu n'inventes JAMAIS d'URL (produit ou fiche technique).
-- Exclure totalement les produits AJAX (déjà filtrés, mais ne jamais en parler).
-- Toujours afficher le prix avec "€ TTC" si disponible.
-- Format commercial: "Nom + Référence + Marque" (ex: Enregistreur NVR 4 canaux DS-7604... de chez HIKVISION)
-- Si le client demande un nombre de canaux non disponible (ex: 6), dire clairement pourquoi et proposer l'alternative au-dessus.
+- Exclure totalement les produits AJAX.
+- Prix: toujours afficher "€ TTC" (le prix fourni est HT, TTC = HT * 1.2).
+- Format nom: "Nom + Référence + Marque" (ex: Enregistreur NVR 4 canaux DS-7604... de chez HIKVISION)
 
-FORMAT DE RÉPONSE:
+FORMAT:
 1) ✅ Produit recommandé (si exact) OU ℹ️ Alternative proposée (si fallback)
-2) 4 à 7 lignes max pour l’enregistreur (incluant lien + prix + FT si dispo)
-3) Si le client a demandé aussi des caméras: proposer 3 caméras réelles (prix croissant) avec (Nom+Réf+Marque, Prix TTC, Lien, FT si dispo)
+2) Bloc enregistreur: 5-7 lignes max (Nom, Canaux si dispo, PoE, Prix TTC, Lien, FT si dispo)
+3) Si le client demande aussi des caméras: proposer 3 caméras réelles (prix croissant) avec (Nom+Réf+Marque, Prix TTC, Lien, FT si dispo)
 4) Terminer par 2-3 questions naturelles (caméras existantes, jours d’archives/HDD, résolution/4K, budget)
 `.trim();
 
@@ -318,11 +275,9 @@ BESOIN CLIENT:
     const camerasBlock = cameraCandidates.length
       ? `\nCAMÉRAS À PROPOSER (prix croissant):\n${cameraCandidates
           .map((c, i) => {
-            const brand = c.brand_name ? ` de chez ${c.brand_name}` : "";
-            const ref = c.sku ? ` ${c.sku}` : "";
             const ft = c.fiche_technique_url ? `\nFiche technique : ${c.fiche_technique_url}` : "";
             return [
-              `${i + 1}) ${c.name || "Caméra"}${ref}${brand}`,
+              `${i + 1}) ${formatOneLine(c)}`,
               `Prix : ${formatPriceTTC(c)}`,
               `Lien : ${c.url || "N/A"}`,
               ft,
@@ -360,13 +315,14 @@ ${camerasBlock}
         ? {
             debug: {
               need,
+              sample_brand_map_size: brandMap.size,
               picked: {
                 exact: picked.exact
                   ? {
                       id: picked.exact.id,
                       url: picked.exact.url,
                       channels: picked.exact.channels,
-                      price: picked.exact.price,
+                      price_ht: picked.exact.price,
                       brand_name: picked.exact.brand_name,
                       fiche_technique_url: picked.exact.fiche_technique_url,
                     }
@@ -376,13 +332,12 @@ ${camerasBlock}
                       id: picked.fallback.id,
                       url: picked.fallback.url,
                       channels: picked.fallback.channels,
-                      price: picked.fallback.price,
+                      price_ht: picked.fallback.price,
                       brand_name: picked.fallback.brand_name,
                       fiche_technique_url: picked.fallback.fiche_technique_url,
                     }
                   : null,
               },
-              sample_brand_map_size: brandMap.size,
               recorder_candidates: recorderCandidates.slice(0, 6),
               camera_candidates: cameraCandidates,
             },
