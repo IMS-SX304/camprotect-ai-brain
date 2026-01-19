@@ -14,7 +14,11 @@ type Candidate = {
   id: number;
   name: string | null;
   url: string | null;
-  price: number | null; // HT en base
+
+  // prix HT en base (product) + fallback min variant
+  price: number | null;
+  min_variant_price?: number | null;
+
   currency: string | null;
   product_type: string | null;
   sku: string | null;
@@ -101,7 +105,12 @@ function formatEUR(n: number): string {
 function detectNeed(input: string): Need {
   const t = input.toLowerCase();
 
-  const wantsPack = t.includes("kit") || t.includes("pack") || t.includes("solution complète") || t.includes("solution complete");
+  const wantsPack =
+    t.includes("kit") ||
+    t.includes("pack") ||
+    t.includes("solution complète") ||
+    t.includes("solution complete") ||
+    t.includes("tout compris");
 
   const wantsRecorder =
     wantsPack ||
@@ -168,14 +177,23 @@ function inferKind(row: any): "recorder" | "camera" | "other" {
 function inferIsIP(row: any): boolean {
   const name = (row?.name || row?.payload?.name || "").toString().toLowerCase();
   const tech = (row?.payload?.technologie || row?.payload?.technology || "").toString().toLowerCase();
-  const compat = (row?.payload?.["compatibilité caméra"] || row?.payload?.compatibilite || "").toString().toLowerCase();
-  return name.includes("ip") || name.includes("nvr") || tech.includes("réseau") || tech.includes("reseau") || compat.includes("onvif");
+  const compat = (row?.payload?.["compatibilité caméra"] || row?.payload?.compatibilite || row?.payload?.compatibility || "").toString().toLowerCase();
+  const typeEnreg = (row?.payload?.["type d'enregistreur"] || "").toString().toLowerCase();
+
+  return (
+    name.includes("ip") ||
+    name.includes("nvr") ||
+    tech.includes("réseau") ||
+    tech.includes("reseau") ||
+    compat.includes("onvif") ||
+    typeEnreg.includes("nvr")
+  );
 }
 
 function inferIsPoE(row: any): boolean {
   const name = (row?.name || row?.payload?.name || "").toString().toLowerCase();
   const alim = (row?.payload?.alimentation || "").toString().toLowerCase();
-  const ports = (row?.payload?.["port et connectivité"] || "").toString().toLowerCase();
+  const ports = (row?.payload?.["port et connectivité"] || row?.payload?.["port et connectivite"] || "").toString().toLowerCase();
   return name.includes("poe") || alim.includes("poe") || ports.includes("poe");
 }
 
@@ -209,24 +227,36 @@ function titleLine(c: Candidate) {
   return `${c.name || "Produit"}${sku}${brand}`.trim();
 }
 
-function formatTTCLine(priceHT: number | null) {
-  if (typeof priceHT !== "number") return "Prix : voir page produit";
-  const ttc = moneyTTC(priceHT);
+function finalPriceHT(c: Candidate): number | null {
+  if (typeof c.price === "number") return c.price;
+  if (typeof c.min_variant_price === "number") return c.min_variant_price;
+  return null;
+}
+
+function formatTTCLine(c: Candidate) {
+  const ht = finalPriceHT(c);
+  if (typeof ht !== "number") return "Prix : voir page produit";
+  const ttc = moneyTTC(ht);
   return `Prix : ${formatEUR(ttc)} € TTC`;
 }
 
-function formatProductCompact(c: Candidate) {
+function mustFTLine(c: Candidate) {
+  return c.fiche_technique_url ? `Fiche technique : ${c.fiche_technique_url}` : null;
+}
+
+function formatProductBlock(c: Candidate) {
   const lines: string[] = [];
-  lines.push(`Nom : ${titleLine(c)}`);
+  lines.push(`- ${titleLine(c)}`);
   if (c.kind === "recorder") {
-    lines.push(`Canaux : ${c.channels ?? "N/A"}  |  PoE : ${c.poe ? "oui" : "non"}  |  IP : ${c.ip ? "oui" : "non"}`);
+    lines.push(`  Canaux : ${c.channels ?? "N/A"}  |  PoE : ${c.poe ? "oui" : "non"}  |  IP : ${c.ip ? "oui" : "non"}`);
   }
   if (c.kind === "camera") {
-    lines.push(`Type : ${c.ip ? "IP" : "Coaxial"}  |  PoE : ${c.poe ? "oui" : "non"}`);
+    lines.push(`  Type : ${c.ip ? "IP" : "Coaxial"}  |  PoE : ${c.poe ? "oui" : "non"}`);
   }
-  lines.push(formatTTCLine(c.price));
-  lines.push(`Lien : ${c.url}`);
-  if (c.fiche_technique_url) lines.push(`Fiche technique : ${c.fiche_technique_url}`);
+  lines.push(`  ${formatTTCLine(c)}`);
+  lines.push(`  Lien : ${c.url}`);
+  const ft = mustFTLine(c);
+  if (ft) lines.push(`  ${ft}`);
   return lines.join("\n");
 }
 
@@ -238,13 +268,14 @@ function pickBestRecorderForPack(recorders: Candidate[], channelsNeed: number, w
 
   if (wantsPoE) pool = pool.filter((r) => r.poe);
 
-  // plus petit nombre de canaux possible d'abord, puis prix
+  // tri: plus petit canaux, puis prix TTC
   pool.sort((a, b) => {
     const ca = a.channels ?? 9999;
     const cb = b.channels ?? 9999;
     if (ca !== cb) return ca - cb;
-    const pa = a.price ?? 999999;
-    const pb = b.price ?? 999999;
+
+    const pa = finalPriceHT(a) ?? 999999;
+    const pb = finalPriceHT(b) ?? 999999;
     return pa - pb;
   });
 
@@ -252,16 +283,18 @@ function pickBestRecorderForPack(recorders: Candidate[], channelsNeed: number, w
 }
 
 function pickCamerasForPack(cameras: Candidate[], wantsPoE: boolean) {
+  // pack IP uniquement (si NVR)
   let pool = cameras.filter((c) => c.kind === "camera" && c.ip);
+
+  // si on veut PoE (pack), on filtre PoE
   if (wantsPoE) pool = pool.filter((c) => c.poe);
 
-  // uniquement prix valides
-  pool = pool.filter((c) => typeof c.price === "number" && (c.price as number) > 0);
+  // on garde celles qui ont un prix via produit OU via variantes
+  pool = pool.filter((c) => typeof finalPriceHT(c) === "number");
 
-  // prix croissant
-  pool.sort((a, b) => (a.price ?? 999999) - (b.price ?? 999999));
+  // tri prix croissant
+  pool.sort((a, b) => (finalPriceHT(a)! - finalPriceHT(b)!));
 
-  // 3 propositions prix croissant
   return pool.slice(0, 3);
 }
 
@@ -305,11 +338,11 @@ export async function POST(req: Request) {
       state,
     });
 
-    // Load products (no brand_label)
+    // Load products
     const { data: raw, error } = await supa
       .from("products")
       .select("id,name,url,price,currency,product_type,sku,fiche_technique_url,payload")
-      .limit(900);
+      .limit(1200);
 
     if (error) {
       return Response.json({ ok: false, error: "Supabase query failed", details: error.message }, { status: 500 });
@@ -317,6 +350,27 @@ export async function POST(req: Request) {
 
     const rowsAll = Array.isArray(raw) ? raw : [];
     const rows = rowsAll.filter((r: any) => !isAjaxProduct(r));
+
+    // --- MIN PRICE VARIANTS (fallback) ---
+    const productIds = rows.map((r: any) => Number(r.id)).filter((n) => Number.isFinite(n));
+    const minPriceByProductId = new Map<number, number>();
+
+    if (productIds.length) {
+      const { data: vars, error: vErr } = await supa
+        .from("product_variants")
+        .select("product_id,price")
+        .in("product_id", productIds);
+
+      if (!vErr && Array.isArray(vars)) {
+        for (const v of vars as any[]) {
+          const pid = Number(v.product_id);
+          const p = typeof v.price === "number" ? v.price : null;
+          if (!Number.isFinite(pid) || p === null) continue;
+          const prev = minPriceByProductId.get(pid);
+          if (prev === undefined || p < prev) minPriceByProductId.set(pid, p);
+        }
+      }
+    }
 
     const candidatesAll: Candidate[] = rows
       .map((r: any) => {
@@ -331,11 +385,14 @@ export async function POST(req: Request) {
         const poe = inferIsPoE(r);
         const ip = inferIsIP(r);
 
+        const minVar = minPriceByProductId.get(pid) ?? null;
+
         return {
           id: pid,
           name,
           url: (r.url || null) as string | null,
           price: typeof r.price === "number" ? r.price : null,
+          min_variant_price: typeof minVar === "number" ? minVar : null,
           currency: (r.currency || "EUR") as string | null,
           product_type: (r.product_type || null) as string | null,
           sku: (r.sku || null) as string | null,
@@ -363,10 +420,9 @@ export async function POST(req: Request) {
 
     const budget = state.budget ?? null;
 
-    // si pack sans nombre clair, on force un “target”
     const effectiveCamsTarget = camsTarget ?? (zones ? cameraRange?.target : 4) ?? 4;
 
-    // si pack: choisir NVR PoE de préférence (si aucun câble tiré => PoE + RJ45 = plus simple)
+    // pack => PoE recommandé (installation simple)
     const wantsPoEForPack = need.wantsPoE || need.wantsPack;
 
     const pickedPackRecorder =
@@ -379,55 +435,99 @@ export async function POST(req: Request) {
         ? pickCamerasForPack(camerasAll, wantsPoEForPack)
         : [];
 
-    // budget estimatif pack (NVR + X caméras au prix “cam 1” si dispo)
     let estTotalTTC: number | null = null;
     if (pickedPackRecorder && pickedPackCameras.length) {
-      const recTTC = typeof pickedPackRecorder.price === "number" ? moneyTTC(pickedPackRecorder.price) : 0;
-      const camTTC = typeof pickedPackCameras[0].price === "number" ? moneyTTC(pickedPackCameras[0].price) : 0;
-      estTotalTTC = Math.round((recTTC + camTTC * effectiveCamsTarget) * 100) / 100;
+      const recHT = finalPriceHT(pickedPackRecorder) ?? 0;
+      const camHT = finalPriceHT(pickedPackCameras[0]) ?? 0;
+      estTotalTTC = Math.round((moneyTTC(recHT) + moneyTTC(camHT) * effectiveCamsTarget) * 100) / 100;
     }
 
-    // RAG sources
     const ragSources = [
       ...(pickedPackRecorder ? [{ id: pickedPackRecorder.id, url: pickedPackRecorder.url }] : []),
       ...pickedPackCameras.map((c) => ({ id: c.id, url: c.url })),
     ].slice(0, 6);
 
-    const packContext = need.wantsPack
-      ? `
-[PACK À CONSTRUIRE]
-- Zones indiquées: ${zones ?? "non précisé"}
-- Plage caméras probable: ${cameraRange ? `${cameraRange.min} à ${cameraRange.max}` : "n/a"}
-- Caméras cible (pour chiffrage): ${effectiveCamsTarget}
-- Budget indiqué: ${budget ? `${budget} €` : "non précisé"}
-- Estimation pack (si dispo): ${estTotalTTC ? `${formatEUR(estTotalTTC)} € TTC` : "n/a"}
+    // --- réponse pack déterministe (toujours produits + FT si dispo) ---
+    if (need.wantsPack) {
+      const intro = zones
+        ? `Pour couvrir ${zones} zones, on part souvent sur ${cameraRange?.min} à ${cameraRange?.max} caméras (selon angles et distances). Je vous propose une base simple et évolutive :`
+        : `Je vous propose un kit complet simple et évolutif :`;
 
-[ENREGISTREUR PROPOSÉ PACK]
-${pickedPackRecorder ? formatProductCompact(pickedPackRecorder) : "Aucun enregistreur trouvé"}
+      const lines: string[] = [];
+      lines.push(intro);
+      lines.push("");
+      lines.push("✅ Enregistreur proposé");
+      lines.push(pickedPackRecorder ? formatProductBlock(pickedPackRecorder) : "- Aucun enregistreur trouvé dans le catalogue");
+      lines.push("");
 
-[CAMÉRAS PROPOSÉES PACK (prix croissant)]
-${pickedPackCameras.length ? pickedPackCameras.map((c) => formatProductCompact(c)).join("\n\n") : "Aucune caméra trouvée"}
-`
-      : "";
+      lines.push("📷 Caméras IP compatibles (prix croissant)");
+      if (pickedPackCameras.length) {
+        pickedPackCameras.forEach((c, i) => {
+          lines.push(`${i + 1}) ${formatProductBlock(c)}`);
+        });
+      } else {
+        lines.push("- Je n’ai pas trouvé de caméras IP exploitables (prix manquant).");
+      }
 
+      if (estTotalTTC) {
+        lines.push("");
+        lines.push(`💶 Estimation (avec ${effectiveCamsTarget} caméras) : ${formatEUR(estTotalTTC)} € TTC`);
+        if (budget) {
+          lines.push(`Budget indiqué : ${budget} €`);
+        }
+      }
+
+      lines.push("");
+      lines.push("Pour affiner rapidement :");
+      lines.push(`- Vous visez plutôt ${cameraRange ? `${cameraRange.min} à ${cameraRange.max}` : "combien"} caméras au total ?`);
+      lines.push("- Installation : intérieur / extérieur (ou les deux) ?");
+      lines.push("- Stockage : combien de jours d’archives souhaitez-vous (HDD déjà prévu ou non) ?");
+
+      const headers = new Headers({ "content-type": "application/json" });
+      if (!cookieId) setCookie(headers, "cp_conversation_id", conversationId);
+
+      // optionnel: petite reformulation IA (mais sans casser le contenu)
+      const final = lines.join("\n");
+
+      await supa.from("chat_sessions").update({ last_assistant_message: final, state }).eq("id", conversationId);
+
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          conversationId,
+          reply: final,
+          rag: { used: ragSources.length ? 1 : 0, sources: ragSources },
+          ...(debug
+            ? {
+                debug: {
+                  need,
+                  state,
+                  pack: {
+                    effectiveCamsTarget,
+                    recorder: pickedPackRecorder,
+                    cameras: pickedPackCameras,
+                    estTotalTTC,
+                  },
+                },
+              }
+            : {}),
+        }),
+        { status: 200, headers }
+      );
+    }
+
+    // Sinon: fallback au LLM (hors pack)
     const policy = `
 RÈGLES OBLIGATOIRES:
-- Ne propose JAMAIS de produits AJAX (toute la marque AJAX) dans les recommandations vidéosurveillance.
-- Ne JAMAIS inventer d’URL: utiliser uniquement les liens fournis.
-- Prix: toujours afficher en € TTC, sinon "voir page produit".
-- Si l’utilisateur parle d’un KIT/PACK => proposer 1 enregistreur + 3 caméras (prix croissant) + estimation budget pour X caméras.
-- Si l’utilisateur indique des "zones": expliquer "souvent entre X et 2X caméras" et demander combien il souhaite réellement.
-- Si enregistreur IP/NVR => proposer uniquement caméras IP (pas coax).
-- Interdiction de dire "je ne peux pas fournir de lien": si catalogue contient des produits, tu proposes.
-STYLE:
-- Réponse commerciale, claire, courte. Pas de listes robot 1/2/3 "prochaine étape".
-- Finir par 3 questions max (nb de caméras exact, type d’usage extérieur/intérieur, stockage/jours).
+- Ne propose JAMAIS de produits AJAX.
+- Ne JAMAIS inventer d’URL.
+- Prix: toujours en € TTC si possible.
+- Si enregistreur IP/NVR => caméras IP uniquement.
 `.trim();
 
     const messages = [
       { role: "system" as const, content: CAMPROTECT_SYSTEM_PROMPT },
       { role: "system" as const, content: policy },
-      ...(packContext ? [{ role: "system" as const, content: packContext }] : []),
       { role: "user" as const, content: input },
     ];
 
@@ -444,20 +544,7 @@ STYLE:
         conversationId,
         reply,
         rag: { used: ragSources.length ? 1 : 0, sources: ragSources },
-        ...(debug
-          ? {
-              debug: {
-                need,
-                state,
-                pack: {
-                  effectiveCamsTarget,
-                  recorder: pickedPackRecorder,
-                  cameras: pickedPackCameras,
-                  estTotalTTC,
-                },
-              },
-            }
-          : {}),
+        ...(debug ? { debug: { need, state } } : {}),
       }),
       { status: 200, headers }
     );
