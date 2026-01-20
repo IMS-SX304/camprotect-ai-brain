@@ -126,16 +126,40 @@ function isAjaxProduct(r: any): boolean {
   return name.includes("ajax") || sku.includes("ajax") || fabricants === AJAX_ID || fabricants === "ajax";
 }
 
+// ===== Helpers payload fields (robuste) =====
+function p(row: any, key: string): string {
+  const v = row?.payload?.[key];
+  if (v === null || v === undefined) return "";
+  return String(v);
+}
+
 // ===== Heuristiques IP/COAX robustes =====
 function refString(row: any): string {
   const n = (row?.name || row?.payload?.name || "").toString();
   const sku = (row?.sku || "").toString();
-  const pref = (row?.payload?.["product-reference"] || row?.payload?.["product reference"] || row?.payload?.["product_reference"] || "").toString();
-  const codeFab = (row?.payload?.["code-fabricant"] || row?.payload?.["code fabricant"] || "").toString();
-  // IMPORTANT : on ajoute des champs souvent utiles si présents
-  const techno = (row?.payload?.technologie || row?.payload?.["technologie"] || "").toString();
-  const alim = (row?.payload?.alimentation || row?.payload?.["alimentation"] || "").toString();
-  return `${n} ${sku} ${pref} ${codeFab} ${techno} ${alim}`.toLowerCase();
+
+  const pref =
+    p(row, "product-reference") ||
+    p(row, "product reference") ||
+    p(row, "product_reference");
+
+  const codeFab = p(row, "code-fabricant") || p(row, "code fabricant");
+
+  const techno = p(row, "technologie");
+
+  // ✅ Ajout des slugs Webflow utilisés chez toi
+  const alimCam =
+    p(row, "alimentation-de-la-camera") ||
+    p(row, "alimentation-camera") ||
+    p(row, "alimentation");
+
+  const alimNvr =
+    p(row, "alimentation-de-l-enregistreur") ||
+    p(row, "alimentation-enregistreur");
+
+  const ports = p(row, "port-et-connectivite") || p(row, "port et connectivité") || p(row, "port et connectivite");
+
+  return `${n} ${sku} ${pref} ${codeFab} ${techno} ${alimCam} ${alimNvr} ${ports}`.toLowerCase();
 }
 
 function looksLikeIPCamera(row: any): boolean {
@@ -180,10 +204,16 @@ function inferKind(row: any): "recorder" | "camera" | "other" {
 }
 
 function inferIsPoE(row: any): boolean {
+  // ✅ Priorité: champ d’alim caméra / enregistreur (le plus fiable chez toi)
+  const alimCam = p(row, "alimentation-de-la-camera").toLowerCase();
+  const alimNvr = p(row, "alimentation-de-l-enregistreur").toLowerCase();
+
+  if (alimCam.includes("poe")) return true;
+  if (alimNvr.includes("poe")) return true;
+
+  // fallback heuristique
   const s = refString(row);
-  const alim = (row?.payload?.alimentation || row?.payload?.["alimentation"] || "").toString().toLowerCase();
-  const ports = (row?.payload?.["port et connectivité"] || row?.payload?.["port et connectivite"] || "").toString().toLowerCase();
-  return s.includes("poe") || alim.includes("poe") || ports.includes("poe");
+  return s.includes("poe");
 }
 
 function inferIsIP(row: any, kind: "recorder" | "camera" | "other"): boolean {
@@ -219,14 +249,18 @@ function setCookie(headers: Headers, name: string, value: string) {
 }
 
 function finalPriceHT(c: Candidate): number | null {
-  if (typeof c.price === "number") return c.price;
-  if (typeof c.min_variant_price === "number") return c.min_variant_price;
-  return null;
+  const p = typeof c.price === "number" ? c.price : null;
+  const mv = typeof c.min_variant_price === "number" ? c.min_variant_price : null;
+  return p ?? mv ?? null;
+}
+
+function hasUsablePriceHT(n: number | null): boolean {
+  return typeof n === "number" && Number.isFinite(n) && n > 0;
 }
 
 function formatTTCLine(c: Candidate) {
   const ht = finalPriceHT(c);
-  if (typeof ht !== "number") return "Prix : voir page produit";
+  if (!hasUsablePriceHT(ht)) return "Prix : voir page produit";
   const ttc = moneyTTC(ht);
   return `Prix : ${formatEUR(ttc)} € TTC`;
 }
@@ -261,7 +295,6 @@ function formatProductBlock(c: Candidate) {
 }
 
 function pickBestRecorderForPack(recorders: Candidate[], channelsNeed: number) {
-  // 1) préférence : NVR PoE
   let pool = recorders
     .filter((r) => r.kind === "recorder")
     .filter((r) => typeof r.channels === "number" && (r.channels as number) >= channelsNeed)
@@ -269,7 +302,6 @@ function pickBestRecorderForPack(recorders: Candidate[], channelsNeed: number) {
 
   const poolPoE = pool.filter((r) => r.poe);
   const usedFallback = poolPoE.length === 0;
-
   const finalPool = poolPoE.length ? poolPoE : pool;
 
   finalPool.sort((a, b) => {
@@ -277,8 +309,8 @@ function pickBestRecorderForPack(recorders: Candidate[], channelsNeed: number) {
     const cb = b.channels ?? 9999;
     if (ca !== cb) return ca - cb;
 
-    const pa = finalPriceHT(a) ?? 999999;
-    const pb = finalPriceHT(b) ?? 999999;
+    const pa = hasUsablePriceHT(finalPriceHT(a)) ? (finalPriceHT(a) as number) : 999999;
+    const pb = hasUsablePriceHT(finalPriceHT(b)) ? (finalPriceHT(b) as number) : 999999;
     return pa - pb;
   });
 
@@ -288,20 +320,21 @@ function pickBestRecorderForPack(recorders: Candidate[], channelsNeed: number) {
 function pickCamerasForPack(cameras: Candidate[], preferPoE: boolean) {
   const ipPool = cameras.filter((c) => c.kind === "camera" && c.ip);
 
-  // ✅ On tente IP+PoE, sinon fallback IP
   let pool = preferPoE ? ipPool.filter((c) => c.poe) : ipPool;
   const usedFallbackPoE = preferPoE && pool.length === 0;
-
   if (usedFallbackPoE) pool = ipPool;
 
-  // tri prix croissant (prix manquants à la fin)
   pool.sort((a, b) => {
     const pa = finalPriceHT(a);
     const pb = finalPriceHT(b);
-    if (typeof pa !== "number" && typeof pb !== "number") return 0;
-    if (typeof pa !== "number") return 1;
-    if (typeof pb !== "number") return -1;
-    return pa - pb;
+
+    const ha = hasUsablePriceHT(pa);
+    const hb = hasUsablePriceHT(pb);
+
+    if (!ha && !hb) return 0;
+    if (!ha) return 1;
+    if (!hb) return -1;
+    return (pa as number) - (pb as number);
   });
 
   return { cameras: pool.slice(0, 3), usedFallbackPoE };
@@ -338,7 +371,6 @@ export async function POST(req: Request) {
       }
     }
 
-    // Load products
     const { data: raw, error } = await supa
       .from("products")
       .select("id,name,url,price,currency,product_type,sku,fiche_technique_url,payload")
@@ -351,7 +383,6 @@ export async function POST(req: Request) {
     const rowsAll = Array.isArray(raw) ? raw : [];
     const rows = rowsAll.filter((r: any) => !isAjaxProduct(r));
 
-    // --- MIN PRICE VARIANTS (fallback) ---
     const productIds = rows.map((r: any) => Number(r.id)).filter((n) => Number.isFinite(n));
     const minPriceByProductId = new Map<number, number>();
 
@@ -413,7 +444,6 @@ export async function POST(req: Request) {
     const recordersAll = candidatesAll.filter((c) => c.kind === "recorder");
     const camerasAll = candidatesAll.filter((c) => c.kind === "camera");
 
-    // ===== PACK =====
     const zones = need.zones;
     const cameraRange = need.cameraRange;
 
@@ -422,9 +452,6 @@ export async function POST(req: Request) {
       (cameraRange?.target ?? null) ??
       4;
 
-    // ✅ Changement clé :
-    // - on préfère PoE si pack
-    // - MAIS on ne bloque plus si aucun PoE détecté
     const preferPoE = need.wantsPoE || need.wantsPack;
 
     if (need.wantsPack) {
@@ -452,7 +479,7 @@ export async function POST(req: Request) {
         lines.push("- Aucune caméra IP n’a été détectée comme compatible (à vérifier côté détection IP / données produit).");
       }
       if (pickedCams.usedFallbackPoE) {
-        lines.push("  ⚠️ Note : je n’ai pas détecté de caméras IP avec PoE renseigné → je vous affiche des caméras IP compatibles (PoE à confirmer sur la fiche).");
+        lines.push("  ⚠️ Note : aucune caméra IP PoE n’a été détectée via le champ alimentation → je vous affiche des caméras IP (PoE à confirmer sur la fiche).");
       }
 
       lines.push("");
@@ -483,7 +510,7 @@ export async function POST(req: Request) {
                     preferPoE,
                     usedFallbackPoE: pickedCams.usedFallbackPoE,
                   },
-                  sampleCameras: camerasAll.slice(0, 5).map((c) => ({
+                  sampleCameras: camerasAll.slice(0, 8).map((c) => ({
                     id: c.id,
                     name: c.name,
                     ip: c.ip,
@@ -492,6 +519,7 @@ export async function POST(req: Request) {
                     price: c.price,
                     min_variant_price: c.min_variant_price,
                     url: c.url,
+                    alim_cam: (c.payload?.["alimentation-de-la-camera"] || "").toString(),
                   })),
                 },
               }
