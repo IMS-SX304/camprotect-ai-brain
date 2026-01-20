@@ -447,10 +447,12 @@ export async function POST(req: Request) {
     const zones = need.zones;
     const cameraRange = need.cameraRange;
 
-    const effectiveCamsTarget =
-      need.requestedCameras ??
-      (cameraRange?.target ?? null) ??
-      4;
+    const effectiveCamsTarget: number =
+  typeof need.requestedCameras === "number"
+    ? need.requestedCameras
+    : typeof cameraRange?.target === "number"
+    ? cameraRange.target
+    : 4;
 
     const preferPoE = need.wantsPoE || need.wantsPack;
 
