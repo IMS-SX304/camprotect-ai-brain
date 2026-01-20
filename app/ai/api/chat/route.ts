@@ -132,28 +132,32 @@ function refString(row: any): string {
   const sku = (row?.sku || "").toString();
   const pref = (row?.payload?.["product-reference"] || row?.payload?.["product reference"] || row?.payload?.["product_reference"] || "").toString();
   const codeFab = (row?.payload?.["code-fabricant"] || row?.payload?.["code fabricant"] || "").toString();
-  return `${n} ${sku} ${pref} ${codeFab}`.toLowerCase();
+  // IMPORTANT : on ajoute des champs souvent utiles si présents
+  const techno = (row?.payload?.technologie || row?.payload?.["technologie"] || "").toString();
+  const alim = (row?.payload?.alimentation || row?.payload?.["alimentation"] || "").toString();
+  return `${n} ${sku} ${pref} ${codeFab} ${techno} ${alim}`.toLowerCase();
 }
 
 function looksLikeIPCamera(row: any): boolean {
   const s = refString(row);
   return (
-    s.includes("ds-2cd") ||             // Hik IP
-    s.includes("ipc-") ||               // Dahua IP (souvent IPC-)
+    s.includes("ds-2cd") ||
+    s.includes("ipc-") ||
     s.includes("dh-ipc") ||
     s.includes("dhi-ipc") ||
     s.includes("network camera") ||
     s.includes("camera ip") ||
     s.includes("caméra ip") ||
-    s.includes("cam ip")
+    s.includes("cam ip") ||
+    s.includes("onvif")
   );
 }
 
 function looksLikeCoaxCamera(row: any): boolean {
   const s = refString(row);
   return (
-    s.includes("ds-2ce") ||             // Hik analog
-    s.includes("hac-") ||               // Dahua HDCVI
+    s.includes("ds-2ce") ||
+    s.includes("hac-") ||
     s.includes("dh-hac") ||
     s.includes("dhi-hac") ||
     s.includes("tvi") ||
@@ -177,7 +181,7 @@ function inferKind(row: any): "recorder" | "camera" | "other" {
 
 function inferIsPoE(row: any): boolean {
   const s = refString(row);
-  const alim = (row?.payload?.alimentation || "").toString().toLowerCase();
+  const alim = (row?.payload?.alimentation || row?.payload?.["alimentation"] || "").toString().toLowerCase();
   const ports = (row?.payload?.["port et connectivité"] || row?.payload?.["port et connectivite"] || "").toString().toLowerCase();
   return s.includes("poe") || alim.includes("poe") || ports.includes("poe");
 }
@@ -185,21 +189,16 @@ function inferIsPoE(row: any): boolean {
 function inferIsIP(row: any, kind: "recorder" | "camera" | "other"): boolean {
   const s = refString(row);
 
-  // Recorders
   if (kind === "recorder") {
-    // NVR => IP, DVR => coax, XVR => hybride (on le traitera comme "IP possible" mais pas PoE intégré souvent)
     if (s.includes("nvr")) return true;
     if (s.includes("dvr")) return false;
-    if (s.includes("xvr")) return true; // hybride : accepte IP + coax (mais PoE pas automatique)
-    // fallback
-    return s.includes("ip");
+    if (s.includes("xvr")) return true; // hybride
+    return s.includes("ip") || s.includes("réseau") || s.includes("reseau");
   }
 
-  // Cameras
   if (kind === "camera") {
     if (looksLikeIPCamera(row)) return true;
     if (looksLikeCoaxCamera(row)) return false;
-    // fallback texte
     return s.includes("ip") || s.includes("réseau") || s.includes("reseau") || s.includes("onvif");
   }
 
@@ -236,11 +235,8 @@ function normalizeTitleLine(c: Candidate) {
   const brand = c.brandLabel ? ` de chez ${c.brandLabel}` : "";
   const sku = c.sku || "";
   const name = c.name || "Produit";
-
-  // évite doublon SKU si déjà dans name
   const hasSku = sku && name.toLowerCase().includes(sku.toLowerCase());
   const skuPart = sku && !hasSku ? ` ${sku}` : "";
-
   return `${name}${skuPart}${brand}`.trim();
 }
 
@@ -264,15 +260,19 @@ function formatProductBlock(c: Candidate) {
   return lines.join("\n");
 }
 
-function pickBestRecorderForPack(recorders: Candidate[], channelsNeed: number, wantsPoE: boolean) {
+function pickBestRecorderForPack(recorders: Candidate[], channelsNeed: number) {
+  // 1) préférence : NVR PoE
   let pool = recorders
     .filter((r) => r.kind === "recorder")
     .filter((r) => typeof r.channels === "number" && (r.channels as number) >= channelsNeed)
-    .filter((r) => r.ip); // pack IP (NVR / XVR possible)
+    .filter((r) => r.ip);
 
-  if (wantsPoE) pool = pool.filter((r) => r.poe);
+  const poolPoE = pool.filter((r) => r.poe);
+  const usedFallback = poolPoE.length === 0;
 
-  pool.sort((a, b) => {
+  const finalPool = poolPoE.length ? poolPoE : pool;
+
+  finalPool.sort((a, b) => {
     const ca = a.channels ?? 9999;
     const cb = b.channels ?? 9999;
     if (ca !== cb) return ca - cb;
@@ -282,14 +282,17 @@ function pickBestRecorderForPack(recorders: Candidate[], channelsNeed: number, w
     return pa - pb;
   });
 
-  return pool[0] ?? null;
+  return { recorder: finalPool[0] ?? null, usedFallbackPoE: usedFallback };
 }
 
-function pickCamerasForPack(cameras: Candidate[], wantsPoE: boolean) {
-  // IP uniquement pour NVR
-  let pool = cameras.filter((c) => c.kind === "camera" && c.ip);
+function pickCamerasForPack(cameras: Candidate[], preferPoE: boolean) {
+  const ipPool = cameras.filter((c) => c.kind === "camera" && c.ip);
 
-  if (wantsPoE) pool = pool.filter((c) => c.poe);
+  // ✅ On tente IP+PoE, sinon fallback IP
+  let pool = preferPoE ? ipPool.filter((c) => c.poe) : ipPool;
+  const usedFallbackPoE = preferPoE && pool.length === 0;
+
+  if (usedFallbackPoE) pool = ipPool;
 
   // tri prix croissant (prix manquants à la fin)
   pool.sort((a, b) => {
@@ -301,7 +304,7 @@ function pickCamerasForPack(cameras: Candidate[], wantsPoE: boolean) {
     return pa - pb;
   });
 
-  return pool.slice(0, 3);
+  return { cameras: pool.slice(0, 3), usedFallbackPoE };
 }
 
 export async function POST(req: Request) {
@@ -317,8 +320,7 @@ export async function POST(req: Request) {
     const need = detectNeed(input);
     const supa = supabaseAdmin();
 
-    // ===== Charger le mapping "fabricants" depuis webflow_options =====
-    // attendu: webflow_options(field_slug, option_id, option_name)
+    // ===== Charger mapping fabricants depuis webflow_options =====
     const brandMap = new Map<string, string>();
     {
       const { data: opts, error: oErr } = await supa
@@ -385,7 +387,6 @@ export async function POST(req: Request) {
 
         const minVar = minPriceByProductId.get(pid) ?? null;
 
-        // Brand label
         const fabricantsId = (r.payload?.fabricants || r.payload?.fabricant || "").toString().trim();
         const brandLabel = fabricantsId ? (brandMap.get(fabricantsId) || null) : null;
 
@@ -421,11 +422,14 @@ export async function POST(req: Request) {
       (cameraRange?.target ?? null) ??
       4;
 
-    const wantsPoEForPack = need.wantsPoE || need.wantsPack;
+    // ✅ Changement clé :
+    // - on préfère PoE si pack
+    // - MAIS on ne bloque plus si aucun PoE détecté
+    const preferPoE = need.wantsPoE || need.wantsPack;
 
     if (need.wantsPack) {
-      const pickedRecorder = pickBestRecorderForPack(recordersAll, effectiveCamsTarget, wantsPoEForPack);
-      const pickedCameras = pickCamerasForPack(camerasAll, wantsPoEForPack);
+      const pickedRecorder = pickBestRecorderForPack(recordersAll, effectiveCamsTarget);
+      const pickedCams = pickCamerasForPack(camerasAll, preferPoE);
 
       const intro = zones
         ? `Pour couvrir ${zones} zones, on part souvent sur ${cameraRange?.min} à ${cameraRange?.max} caméras (selon angles et distances). Je vous propose une base simple et évolutive :`
@@ -435,13 +439,20 @@ export async function POST(req: Request) {
       lines.push(intro);
       lines.push("");
       lines.push("✅ Enregistreur proposé");
-      lines.push(pickedRecorder ? formatProductBlock(pickedRecorder) : "- Aucun enregistreur trouvé");
+      lines.push(pickedRecorder.recorder ? formatProductBlock(pickedRecorder.recorder) : "- Aucun enregistreur trouvé");
+      if (pickedRecorder.usedFallbackPoE) {
+        lines.push("  ⚠️ Note : cet enregistreur n’intègre pas le PoE → prévoir un switch PoE / injecteurs PoE si vous partez sur des caméras PoE.");
+      }
+
       lines.push("");
       lines.push("📷 Caméras IP compatibles (prix croissant)");
-      if (pickedCameras.length) {
-        pickedCameras.forEach((c, i) => lines.push(`${i + 1}) ${formatProductBlock(c)}`));
+      if (pickedCams.cameras.length) {
+        pickedCams.cameras.forEach((c, i) => lines.push(`${i + 1}) ${formatProductBlock(c)}`));
       } else {
-        lines.push("- Aucune caméra IP n’a été détectée comme compatible (vérifier détection IP / données).");
+        lines.push("- Aucune caméra IP n’a été détectée comme compatible (à vérifier côté détection IP / données produit).");
+      }
+      if (pickedCams.usedFallbackPoE) {
+        lines.push("  ⚠️ Note : je n’ai pas détecté de caméras IP avec PoE renseigné → je vous affiche des caméras IP compatibles (PoE à confirmer sur la fiche).");
       }
 
       lines.push("");
@@ -466,7 +477,11 @@ export async function POST(req: Request) {
                     candidatesAll: candidatesAll.length,
                     recordersAll: recordersAll.length,
                     camerasAll: camerasAll.length,
-                    pickedCameras: pickedCameras.length,
+                    pickedCameras: pickedCams.cameras.length,
+                  },
+                  cameraPick: {
+                    preferPoE,
+                    usedFallbackPoE: pickedCams.usedFallbackPoE,
                   },
                   sampleCameras: camerasAll.slice(0, 5).map((c) => ({
                     id: c.id,
@@ -495,10 +510,7 @@ export async function POST(req: Request) {
     const headers = new Headers({ "content-type": "application/json" });
     if (!cookieId) setCookie(headers, "cp_conversation_id", conversationId);
 
-    return new Response(
-      JSON.stringify({ ok: true, conversationId, reply }),
-      { status: 200, headers }
-    );
+    return new Response(JSON.stringify({ ok: true, conversationId, reply }), { status: 200, headers });
   } catch (e: any) {
     return Response.json({ ok: false, error: "Internal error", details: e?.message || String(e) }, { status: 500 });
   }
