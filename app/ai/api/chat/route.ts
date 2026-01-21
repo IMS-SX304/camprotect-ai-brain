@@ -13,7 +13,7 @@ type ProductRow = {
   id: number;
   name: string | null;
   url: string | null;
-  price: number | null; // HT (chez toi)
+  price: number | null; // HT (souvent vide si prix via variantes)
   currency: string | null;
   product_type: string | null;
   sku: string | null;
@@ -33,6 +33,10 @@ type CandidateBase = {
   fiche_technique_url: string | null;
   brand_option_id: string | null;
   brand_name: string | null;
+
+  // debug
+  price_ht_final?: number | null;
+  min_variant_price?: number | null;
 };
 
 type RecorderKind = "NVR" | "DVR" | "XVR" | "UNKNOWN";
@@ -62,7 +66,6 @@ function lc(v: any) {
 
 function priceHtToTtc(priceHt: number | null) {
   if (typeof priceHt !== "number" || !Number.isFinite(priceHt) || priceHt <= 0) return null;
-  // TVA 20%
   return Math.round(priceHt * 1.2 * 100) / 100;
 }
 function formatMoneyEUR_TTC(priceTtc: number | null) {
@@ -203,7 +206,6 @@ function pickPackRecorder(recorders: RecorderCandidate[], zones: number, wantsPo
   const maxCh = zones * 2;
 
   let pool = [...recorders];
-
   if (wantsIP) pool = pool.filter((r) => r.kind === "NVR" || r.ip);
   if (wantsPoE) pool = pool.filter((r) => r.poe);
 
@@ -221,10 +223,14 @@ function pickPackRecorder(recorders: RecorderCandidate[], zones: number, wantsPo
   return above ?? (sorted[0] ?? null);
 }
 
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
+}
+
 function pickCamerasForRecorder(
   cameras: CameraCandidate[],
   recorder: RecorderCandidate,
-  zones: number,
+  camCount: number,
   budget: number | null,
   wantsOutdoor: boolean,
   wantsPoE: boolean
@@ -234,7 +240,7 @@ function pickCamerasForRecorder(
   // compat selon enregistreur
   if (recorder.kind === "NVR") pool = pool.filter((c) => c.kind === "IP" || c.kind === "UNKNOWN");
   if (recorder.kind === "DVR") pool = pool.filter((c) => c.kind === "COAX" || c.kind === "UNKNOWN");
-  // XVR: accepte IP+COAX => pas de filtre
+  // XVR => IP + COAX
 
   if (wantsOutdoor) pool = pool.filter((c) => c.outdoor);
   if (wantsPoE) pool = pool.filter((c) => c.poe);
@@ -243,28 +249,21 @@ function pickCamerasForRecorder(
   pool = pool.filter((c) => typeof c.price_ttc === "number" && (c.price_ttc as number) > 0);
 
   pool.sort((a, b) => (a.price_ttc as number) - (b.price_ttc as number));
-
   const picks = pool.slice(0, 3);
 
-  // note budget (optionnel)
-  const targetMin = zones;
-  const targetMax = zones * 2;
-  let affordabilityNote: string | null = null;
-
-  if (budget && picks.length) {
+  // budget recap
+  let budgetRecap: string | null = null;
+  if (budget && recorder.price_ttc && picks.length) {
     const unit = picks[0].price_ttc as number;
-    const maxUnits = Math.floor(budget / unit);
-    const suggested = Math.max(targetMin, Math.min(targetMax, maxUnits));
-    affordabilityNote =
-      suggested >= targetMin
-        ? `Avec ~${unit.toFixed(2).replace(".", ",")} € TTC / caméra (modèle le plus abordable), votre budget permet environ ${suggested} caméras (objectif ${targetMin} à ${targetMax}).`
-        : `Votre budget semble serré pour ${targetMin} caméras : on peut ajuster la gamme (2MP/4MP) ou optimiser stockage.`;
+    const total = Math.round((recorder.price_ttc + camCount * unit) * 100) / 100;
+    const status = total <= budget ? "✅ Dans le budget" : "⚠️ Au-dessus du budget (on ajuste la gamme)";
+    budgetRecap = `Budget : ${budget.toFixed(0)} € | Estimation : ${total.toFixed(2).replace(".", ",")} € TTC (${camCount} caméras + enregistreur) — ${status}`;
   }
 
-  return { picks, affordabilityNote };
+  return { picks, budgetRecap };
 }
 
-// --------- Brand cache (fast) ----------
+// --------- Brand cache ----------
 let BRAND_CACHE: { at: number; map: Map<string, string> } | null = null;
 const BRAND_CACHE_TTL_MS = 10 * 60 * 1000;
 
@@ -288,7 +287,29 @@ async function getBrandMap(supa: ReturnType<typeof supabaseAdmin>) {
   return map;
 }
 
-// --------- formatting reply (no OpenAI = fast) ----------
+// --------- Min variant price map ----------
+async function getMinVariantPriceMap(supa: ReturnType<typeof supabaseAdmin>, productIds: number[]) {
+  const map = new Map<number, number>();
+  if (!productIds.length) return map;
+
+  const { data, error } = await supa
+    .from("product_variants")
+    .select("product_id,price")
+    .in("product_id", productIds);
+
+  if (error || !Array.isArray(data)) return map;
+
+  for (const v of data as any[]) {
+    const pid = Number(v.product_id);
+    const p = typeof v.price === "number" ? v.price : null;
+    if (!Number.isFinite(pid) || p === null || !Number.isFinite(p) || p <= 0) continue;
+    const prev = map.get(pid);
+    if (prev === undefined || p < prev) map.set(pid, p);
+  }
+  return map;
+}
+
+// --------- formatting reply ----------
 function formatRecorderBlock(r: RecorderCandidate, title: "✅ Produit recommandé" | "ℹ️ Alternative proposée") {
   const brand = r.brand_name ? ` de chez ${r.brand_name}` : "";
   const sku = r.sku ? ` ${r.sku}` : "";
@@ -306,7 +327,7 @@ function formatRecorderBlock(r: RecorderCandidate, title: "✅ Produit recommand
 }
 
 function formatCameraList(cams: CameraCandidate[]) {
-  if (!cams.length) return `📷 Caméras compatibles (prix croissant)\n- Aucune caméra compatible trouvée (prix manquant / données insuffisantes).`;
+  if (!cams.length) return ""; // IMPORTANT: on n’affiche rien si vide
 
   const lines: string[] = [];
   lines.push(`📷 Caméras compatibles (prix croissant)`);
@@ -336,17 +357,15 @@ export async function POST(req: Request) {
     const conversationId = body.conversationId ?? crypto.randomUUID();
     const need = detectNeed(input);
 
-    // IMPORTANT: éviter 504 => requêtes ciblées et limitées
     const supa = supabaseAdmin();
     const brandMap = await getBrandMap(supa);
 
     // 1) Recorders (ciblé)
-    // on cherche nvr/dvr/xvr via name OR product_type
     const { data: recRaw, error: recErr } = await supa
       .from("products")
       .select("id,name,url,price,currency,product_type,sku,fiche_technique_url,payload,brand")
       .or("name.ilike.%nvr%,name.ilike.%dvr%,name.ilike.%xvr%,name.ilike.%enregistreur%,product_type.ilike.%nvr%,product_type.ilike.%dvr%,product_type.ilike.%xvr%")
-      .limit(120);
+      .limit(140);
 
     if (recErr) {
       return Response.json({ ok: false, error: "Supabase query failed", details: recErr.message }, { status: 500 });
@@ -355,11 +374,7 @@ export async function POST(req: Request) {
     const recRows: ProductRow[] = Array.isArray(recRaw) ? (recRaw as any) : [];
 
     // 2) Cameras (ciblé)
-    // IP cams: sku starts with ds-2cd or ipc-
-    // COAX cams: ds-2ce
-    // plus "caméra" keyword in name as fallback
     const wantsIPForCameraQuery = need.wantsCoax ? false : true;
-
     const camOr = wantsIPForCameraQuery
       ? "sku.ilike.ds-2cd%,sku.ilike.ipc-%,name.ilike.%caméra%,name.ilike.%camera%"
       : "sku.ilike.ds-2ce%,name.ilike.%caméra%,name.ilike.%camera%";
@@ -368,7 +383,7 @@ export async function POST(req: Request) {
       .from("products")
       .select("id,name,url,price,currency,product_type,sku,fiche_technique_url,payload,brand")
       .or(camOr)
-      .limit(220);
+      .limit(260);
 
     if (camErr) {
       return Response.json({ ok: false, error: "Supabase query failed", details: camErr.message }, { status: 500 });
@@ -376,7 +391,14 @@ export async function POST(req: Request) {
 
     const camRows: ProductRow[] = Array.isArray(camRaw) ? (camRaw as any) : [];
 
-    // 3) Build candidates + exclude AJAX
+    // 3) min variant price for all loaded ids (rec + cam)
+    const allIds = [
+      ...recRows.map((r) => Number(r.id)).filter((n) => Number.isFinite(n)),
+      ...camRows.map((r) => Number(r.id)).filter((n) => Number.isFinite(n)),
+    ];
+    const minVarMap = await getMinVariantPriceMap(supa, Array.from(new Set(allIds)));
+
+    // 4) Exclude AJAX
     const isAjax = (brandName: string | null, name: string | null, sku: string | null) => {
       const b = (brandName || "").toUpperCase();
       const n = (name || "").toLowerCase();
@@ -387,6 +409,7 @@ export async function POST(req: Request) {
       return false;
     };
 
+    // 5) Build recorder candidates
     const recordersAll: RecorderCandidate[] = recRows
       .map((r) => {
         const brandOptionId = r.brand ? String(r.brand) : null;
@@ -402,10 +425,13 @@ export async function POST(req: Request) {
         const poe = hay.includes("poe");
         const ip = kind === "NVR" || hay.includes("ip");
 
-        const price_ttc = priceHtToTtc(r.price);
+        const pid = Number(r.id);
+        const minVar = minVarMap.get(pid) ?? null;
+        const price_ht_final = typeof r.price === "number" && r.price > 0 ? r.price : minVar;
+        const price_ttc = priceHtToTtc(price_ht_final);
 
         return {
-          id: Number(r.id),
+          id: pid,
           name,
           url: r.url ?? null,
           price_ttc,
@@ -419,10 +445,13 @@ export async function POST(req: Request) {
           channels,
           poe,
           ip,
+          price_ht_final,
+          min_variant_price: minVar,
         };
       })
       .filter((r) => !isAjax(r.brand_name, r.name, r.sku));
 
+    // 6) Build camera candidates
     const camerasAll: CameraCandidate[] = camRows
       .map((r) => {
         const brandOptionId = r.brand ? String(r.brand) : null;
@@ -437,10 +466,13 @@ export async function POST(req: Request) {
         const outdoor = detectOutdoor(r.payload, hay);
         const mp = extractMP(r.payload, hay);
 
-        const price_ttc = priceHtToTtc(r.price);
+        const pid = Number(r.id);
+        const minVar = minVarMap.get(pid) ?? null;
+        const price_ht_final = typeof r.price === "number" && r.price > 0 ? r.price : minVar;
+        const price_ttc = priceHtToTtc(price_ht_final);
 
         return {
-          id: Number(r.id),
+          id: pid,
           name,
           url: r.url ?? null,
           price_ttc,
@@ -454,17 +486,24 @@ export async function POST(req: Request) {
           poe,
           outdoor,
           mp,
+          price_ht_final,
+          min_variant_price: minVar,
         };
       })
       .filter((c) => !isAjax(c.brand_name, c.name, c.sku));
 
-    // 4) Pick logic (kit/pack or single recorder)
+    // 7) Pick logic
     const zones = need.zones ?? 5;
     const budget = need.budget ?? null;
 
+    // nombre de caméras à estimer
+    const camCount = need.requestedChannels
+      ? need.requestedChannels
+      : clamp(zones, zones, zones * 2);
+
     let pickedRecorder: RecorderCandidate | null = null;
     let camerasPicked: CameraCandidate[] = [];
-    let affordabilityNote: string | null = null;
+    let budgetRecap: string | null = null;
     let title: "✅ Produit recommandé" | "ℹ️ Alternative proposée" = "✅ Produit recommandé";
 
     if (need.wantsPack || need.zones !== null || (need.budget !== null && need.wantsCamera)) {
@@ -474,16 +513,15 @@ export async function POST(req: Request) {
         const camPick = pickCamerasForRecorder(
           camerasAll,
           pickedRecorder,
-          zones,
+          camCount,
           budget,
           need.wantsOutdoor,
           need.wantsPoE
         );
         camerasPicked = camPick.picks;
-        affordabilityNote = camPick.affordabilityNote;
+        budgetRecap = camPick.budgetRecap;
       }
     } else {
-      // enregistreur spécifique
       let pool = [...recordersAll];
       if (need.wantsIP) pool = pool.filter((r) => r.kind === "NVR" || r.ip);
       if (need.wantsCoax) pool = pool.filter((r) => r.kind === "DVR" || r.kind === "XVR");
@@ -492,13 +530,25 @@ export async function POST(req: Request) {
       const picked = pickBestRecorder(pool, need.requestedChannels);
       pickedRecorder = picked.exact ?? picked.fallback ?? null;
 
-      // si fallback (ex: 6 demandé => 8 proposé)
       if (!picked.exact && picked.fallback && typeof need.requestedChannels === "number") {
         title = "ℹ️ Alternative proposée";
       }
+
+      // si l’utilisateur parle caméras, on peut proposer une shortlist
+      if (pickedRecorder && (need.wantsCamera || need.requestedChannels)) {
+        const camPick = pickCamerasForRecorder(
+          camerasAll,
+          pickedRecorder,
+          camCount,
+          budget,
+          need.wantsOutdoor,
+          need.wantsPoE
+        );
+        camerasPicked = camPick.picks;
+        budgetRecap = camPick.budgetRecap;
+      }
     }
 
-    // 5) Build reply (fast)
     if (!pickedRecorder) {
       return Response.json({
         ok: true,
@@ -506,20 +556,12 @@ export async function POST(req: Request) {
         reply:
           "Je n’ai pas trouvé d’enregistreur correspondant dans le catalogue.\n\nPour avancer :\n- Combien de caméras au total ? (4 / 8 / 16…)\n- IP (RJ45) ou coaxial (câble TV) ?\n- Budget approximatif ?",
         rag: { used: 0, sources: [] },
-        ...(debug ? { debug: { need, counts: { recordersAll: recordersAll.length, camerasAll: camerasAll.length } } } : {}),
+        ...(debug ? { debug: { need } } : {}),
       });
     }
 
+    // 8) Reply formatting
     const recorderBlock = formatRecorderBlock(pickedRecorder, title);
-
-    // compat camera selection (si l’utilisateur parle caméras)
-    let camerasBlock = "";
-    if (need.wantsCamera || need.wantsPack) {
-      camerasBlock = "\n\n" + formatCameraList(camerasPicked);
-      if (need.wantsPoE && camerasPicked.length && camerasPicked.every((c) => !c.poe)) {
-        camerasBlock += "\n\n⚠️ Note : aucune caméra PoE n’a été détectée via le champ alimentation → PoE à confirmer sur la fiche produit.";
-      }
-    }
 
     const questions = [
       "Pour affiner :",
@@ -528,9 +570,23 @@ export async function POST(req: Request) {
       "- Combien de jours d’archives souhaitez-vous (HDD déjà prévu ou non) ?",
     ].join("\n");
 
+    let camerasBlock = "";
+    if (need.wantsCamera || need.wantsPack || need.requestedChannels) {
+      const camList = formatCameraList(camerasPicked);
+      if (camList) {
+        camerasBlock = "\n\n" + camList;
+      } else {
+        // pas de bloc vide => on bascule sur question directe
+        camerasBlock =
+          "\n\n📷 Caméras : je peux vous proposer des modèles compatibles, mais il me manque un critère pour trier correctement.\n" +
+          "- Vous les voulez plutôt intérieur, extérieur, ou mixte ?\n" +
+          "- Résolution visée : 1080p, 4MP, ou 8MP ?";
+      }
+    }
+
     const replyParts = [
       recorderBlock,
-      affordabilityNote ? `\n\n${affordabilityNote}` : "",
+      budgetRecap ? `\n\n${budgetRecap}` : "",
       camerasBlock,
       `\n\n${questions}`,
     ].filter(Boolean);
@@ -551,8 +607,11 @@ export async function POST(req: Request) {
         ? {
             debug: {
               need,
+              camCount,
+              budget,
               counts: { recordersAll: recordersAll.length, camerasAll: camerasAll.length, camerasPicked: camerasPicked.length },
               pickedRecorder: { id: pickedRecorder.id, kind: pickedRecorder.kind, channels: pickedRecorder.channels },
+              sampleCameraPrices: camerasPicked.map((c) => ({ id: c.id, ht: c.price_ht_final, ttc: c.price_ttc, poe: c.poe })),
             },
           }
         : {}),
