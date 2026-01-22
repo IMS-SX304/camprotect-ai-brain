@@ -87,14 +87,31 @@ function extractZones(input: string): number | null {
   return null;
 }
 
+/**
+ * Budget extraction robuste:
+ * - "850€", "850 €", "850 euros", "1 500€", "1500 eur"
+ * - accepte espaces et séparateurs
+ */
 function extractBudgetEUR(input: string): number | null {
-  const t = input.replace(/\s/g, "");
-  const m = t.match(/(\d{2,6})(?:[.,](\d{1,2}))?(?:€|eur)\b/i);
+  const raw = input
+    .toLowerCase()
+    .replace(/\u00a0/g, " ") // no-break space
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Exemple match:
+  // "budget 850€" / "850 euros" / "1 500 €"
+  const m = raw.match(/(\d[\d\s.,]{1,8}\d)\s*(€|eur|euro|euros)\b/i);
   if (!m) return null;
-  const euros = Number(m[1]);
-  const cents = m[2] ? Number(m[2].padEnd(2, "0")) : 0;
-  if (!Number.isFinite(euros)) return null;
-  return euros + cents / 100;
+
+  const num = m[1]
+    .replace(/\s/g, "")
+    .replace(",", ".")
+    .trim();
+
+  const val = Number(num);
+  if (!Number.isFinite(val) || val <= 0) return null;
+  return val;
 }
 
 function detectNeed(input: string) {
@@ -227,6 +244,40 @@ function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
 }
 
+/**
+ * Construit une estimation "pack" :
+ * - camMin = zones
+ * - camMax = zones*2
+ * - totalMin = recorder + camMin * cheapestCam
+ * - totalMax = recorder + camMax * cheapestCam
+ * Si budget présent => statut OK ou à ajuster
+ */
+function buildPackEstimateLine(args: {
+  zones: number;
+  recorderPriceTtc: number | null;
+  cheapestCamPriceTtc: number | null;
+  budget: number | null;
+}) {
+  const { zones, recorderPriceTtc, cheapestCamPriceTtc, budget } = args;
+  if (!recorderPriceTtc || !cheapestCamPriceTtc) return null;
+
+  const camMin = zones;
+  const camMax = zones * 2;
+
+  const totalMin = Math.round((recorderPriceTtc + camMin * cheapestCamPriceTtc) * 100) / 100;
+  const totalMax = Math.round((recorderPriceTtc + camMax * cheapestCamPriceTtc) * 100) / 100;
+
+  const range = `Estimation pack (hors HDD/câbles) : ${totalMin.toFixed(2).replace(".", ",")} € à ${totalMax
+    .toFixed(2)
+    .replace(".", ",")} € TTC (${camMin} à ${camMax} caméras + enregistreur)`;
+
+  if (!budget) return range;
+
+  const ok = totalMin <= budget;
+  const status = ok ? "✅ Compatible avec votre budget (selon le nombre de caméras)" : "⚠️ Risque de dépassement (on ajuste la gamme)";
+  return `${range}\nBudget client : ${budget.toFixed(0)} € — ${status}`;
+}
+
 function pickCamerasForRecorder(
   cameras: CameraCandidate[],
   recorder: RecorderCandidate,
@@ -251,16 +302,18 @@ function pickCamerasForRecorder(
   pool.sort((a, b) => (a.price_ttc as number) - (b.price_ttc as number));
   const picks = pool.slice(0, 3);
 
-  // budget recap
+  // estimation pack (toujours si pack)
+  const cheapest = picks.length ? (picks[0].price_ttc as number) : null;
+
+  // budget recap (détaillé camCount) — optionnel
   let budgetRecap: string | null = null;
-  if (budget && recorder.price_ttc && picks.length) {
-    const unit = picks[0].price_ttc as number;
-    const total = Math.round((recorder.price_ttc + camCount * unit) * 100) / 100;
+  if (budget && recorder.price_ttc && cheapest) {
+    const total = Math.round((recorder.price_ttc + camCount * cheapest) * 100) / 100;
     const status = total <= budget ? "✅ Dans le budget" : "⚠️ Au-dessus du budget (on ajuste la gamme)";
     budgetRecap = `Budget : ${budget.toFixed(0)} € | Estimation : ${total.toFixed(2).replace(".", ",")} € TTC (${camCount} caméras + enregistreur) — ${status}`;
   }
 
-  return { picks, budgetRecap };
+  return { picks, cheapestCam: cheapest, budgetRecap };
 }
 
 // --------- Brand cache ----------
@@ -327,7 +380,7 @@ function formatRecorderBlock(r: RecorderCandidate, title: "✅ Produit recommand
 }
 
 function formatCameraList(cams: CameraCandidate[]) {
-  if (!cams.length) return ""; // IMPORTANT: on n’affiche rien si vide
+  if (!cams.length) return "";
 
   const lines: string[] = [];
   lines.push(`📷 Caméras compatibles (prix croissant)`);
@@ -497,18 +550,20 @@ export async function POST(req: Request) {
     const budget = need.budget ?? null;
 
     // nombre de caméras à estimer
-    const camCount = need.requestedChannels
-      ? need.requestedChannels
-      : clamp(zones, zones, zones * 2);
+    const camCount = need.requestedChannels ? need.requestedChannels : clamp(zones, zones, zones * 2);
 
     let pickedRecorder: RecorderCandidate | null = null;
     let camerasPicked: CameraCandidate[] = [];
     let budgetRecap: string | null = null;
+    let packEstimateLine: string | null = null;
     let title: "✅ Produit recommandé" | "ℹ️ Alternative proposée" = "✅ Produit recommandé";
 
-    if (need.wantsPack || need.zones !== null || (need.budget !== null && need.wantsCamera)) {
+    const isPackScenario = need.wantsPack || need.zones !== null || (need.budget !== null && need.wantsCamera);
+
+    if (isPackScenario) {
       const wantsIP = need.wantsCoax ? false : true;
       pickedRecorder = pickPackRecorder(recordersAll, zones, need.wantsPoE, wantsIP);
+
       if (pickedRecorder) {
         const camPick = pickCamerasForRecorder(
           camerasAll,
@@ -520,6 +575,14 @@ export async function POST(req: Request) {
         );
         camerasPicked = camPick.picks;
         budgetRecap = camPick.budgetRecap;
+
+        // IMPORTANT: estimation pack même sans budget
+        packEstimateLine = buildPackEstimateLine({
+          zones,
+          recorderPriceTtc: pickedRecorder.price_ttc ?? null,
+          cheapestCamPriceTtc: camPick.cheapestCam ?? null,
+          budget,
+        });
       }
     } else {
       let pool = [...recordersAll];
@@ -534,7 +597,6 @@ export async function POST(req: Request) {
         title = "ℹ️ Alternative proposée";
       }
 
-      // si l’utilisateur parle caméras, on peut proposer une shortlist
       if (pickedRecorder && (need.wantsCamera || need.requestedChannels)) {
         const camPick = pickCamerasForRecorder(
           camerasAll,
@@ -571,22 +633,22 @@ export async function POST(req: Request) {
     ].join("\n");
 
     let camerasBlock = "";
-    if (need.wantsCamera || need.wantsPack || need.requestedChannels) {
+    if (need.wantsCamera || isPackScenario || need.requestedChannels) {
       const camList = formatCameraList(camerasPicked);
       if (camList) {
         camerasBlock = "\n\n" + camList;
       } else {
-        // pas de bloc vide => on bascule sur question directe
         camerasBlock =
-          "\n\n📷 Caméras : je peux vous proposer des modèles compatibles, mais il me manque un critère pour trier correctement.\n" +
-          "- Vous les voulez plutôt intérieur, extérieur, ou mixte ?\n" +
+          "\n\n📷 Caméras : je peux vous proposer des modèles compatibles, mais il me manque un critère.\n" +
+          "- Intérieur / extérieur / mixte ?\n" +
           "- Résolution visée : 1080p, 4MP, ou 8MP ?";
       }
     }
 
     const replyParts = [
       recorderBlock,
-      budgetRecap ? `\n\n${budgetRecap}` : "",
+      packEstimateLine ? `\n\n${packEstimateLine}` : "",
+      budgetRecap && !packEstimateLine ? `\n\n${budgetRecap}` : "",
       camerasBlock,
       `\n\n${questions}`,
     ].filter(Boolean);
@@ -607,11 +669,13 @@ export async function POST(req: Request) {
         ? {
             debug: {
               need,
-              camCount,
+              zones,
               budget,
+              camCount,
               counts: { recordersAll: recordersAll.length, camerasAll: camerasAll.length, camerasPicked: camerasPicked.length },
-              pickedRecorder: { id: pickedRecorder.id, kind: pickedRecorder.kind, channels: pickedRecorder.channels },
-              sampleCameraPrices: camerasPicked.map((c) => ({ id: c.id, ht: c.price_ht_final, ttc: c.price_ttc, poe: c.poe })),
+              pickedRecorder: { id: pickedRecorder.id, kind: pickedRecorder.kind, channels: pickedRecorder.channels, price_ttc: pickedRecorder.price_ttc },
+              pickedCams: camerasPicked.map((c) => ({ id: c.id, sku: c.sku, ttc: c.price_ttc, poe: c.poe, kind: c.kind })),
+              packEstimateLine,
             },
           }
         : {}),
